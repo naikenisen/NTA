@@ -487,8 +487,8 @@ def setup_render_settings():
     # Utiliser Cycles pour meilleur motion blur et DOF
     scene.render.engine = 'CYCLES'
     scene.cycles.device = 'CPU'  # ou 'GPU' si disponible
-    scene.cycles.samples = 64    # Suffisant avec denoiser
-    scene.cycles.use_denoising = True
+    scene.cycles.samples = 64    # Suffisant sans denoiser
+    scene.cycles.use_denoising = False  # Désactivé (non supporté sur certaines builds)
     
     # Motion blur
     scene.render.use_motion_blur = True
