@@ -183,7 +183,7 @@ class IlluminationParameters:
 @dataclass
 class ImagingParameters:
     numerical_aperture: float = 0.3
-    magnification: float = 200.0            # Fort zoom sur la particule
+    magnification: float = 50.0             # Dézoom ×4 (était 200)
     camera_pixel_size_um: float = 6.5
     image_pixels: int = 256                  # Résolution augmentée
     reference_amplitude: float = 1.0

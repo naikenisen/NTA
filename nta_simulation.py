@@ -202,7 +202,7 @@ class LaserParameters:
 class ImagingParameters:
     """Paramètres d'imagerie en fond noir pour NTA."""
     numerical_aperture: float = 0.4       # NA typique pour NTA
-    magnification: float = 20.0           # Grossissement
+    magnification: float = 100.0          # Grossissement (zoom sur particule)
     camera_pixel_size_um: float = 6.5     # Taille pixel CMOS
     image_pixels: int = 256               # Résolution image
     exposure_time_ms: float = 30.0        # Temps d'exposition
@@ -798,13 +798,6 @@ def run_comparison(
     ax3.set_title('Image NTA (Dark Field) - LISSE\n(Fond noir, particule brillante)', fontweight='bold')
     plt.colorbar(im3, ax=ax3, label='Intensité', shrink=0.8)
     
-    # Ajouter cercle pour montrer la taille de l'Airy disk
-    airy_r = 0.61 * (wavelength_nm/1000) / numerical_aperture
-    circle = plt.Circle((0, 0), airy_r, fill=False, color='cyan', 
-                        linestyle='--', linewidth=1.5, label=f'Airy (r={airy_r:.2f}µm)')
-    ax3.add_patch(circle)
-    ax3.legend(loc='upper right', fontsize=8)
-    
     # Colonne 2 : Image rugueuse
     ax4 = fig.add_subplot(4, 2, 4)
     im4 = ax4.imshow(img_rough.T, origin='lower', extent=extent_img,
@@ -813,9 +806,6 @@ def run_comparison(
     ax4.set_ylabel('Y [μm]')
     ax4.set_title('Image NTA (Dark Field) - RUGUEUSE\n(Fond noir, particule brillante)', fontweight='bold')
     plt.colorbar(im4, ax=ax4, label='Intensité', shrink=0.8)
-    circle2 = plt.Circle((0, 0), airy_r, fill=False, color='cyan', 
-                         linestyle='--', linewidth=1.5)
-    ax4.add_patch(circle2)
     
     # =====================================================================
     # LIGNE 3 : ANALYSE SPECTRALE (FFT)
