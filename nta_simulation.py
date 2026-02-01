@@ -23,9 +23,36 @@ Différences avec Videodrop :
 ===============================================================================
 """
 
+# =============================================================================
+# HYPERPARAMÈTRES DE SIMULATION
+# =============================================================================
+# Modifier ces valeurs pour changer les paramètres de simulation
+
+HYPERPARAMS = {
+    # Particule
+    'radius_nm': 200.0,             # Rayon de la particule [nm]
+    'roughness_nm': 50.0,           # Amplitude RMS de la rugosité [nm]
+    'roughness_lmax': 10,           # Ordre max des harmoniques sphériques
+    'refractive_index': 1.50,       # Indice de réfraction (polystyrène)
+    
+    # Optique (Laser)
+    'wavelength_nm': 532.0,         # Longueur d'onde LASER [nm]
+    'numerical_aperture': 0.4,      # Ouverture numérique
+    
+    # Image
+    'image_pixels': 256,            # Résolution de l'image [pixels]
+    
+    # Sauvegarde
+    'save_path': 'nta_comparison.png',  # Fichier de sortie (None = pas de sauvegarde)
+    
+    # Mode démo d⁶ (si True, lance la démo au lieu de la comparaison)
+    'demo_d6': False,
+}
+
+# =============================================================================
+
 import numpy as np
 import matplotlib.pyplot as plt
-import argparse
 from dataclasses import dataclass
 from typing import Tuple, Optional, List
 
@@ -1066,48 +1093,21 @@ def demo_d6_effect(
 # =============================================================================
 
 if __name__ == "__main__":
-    import sys
-    
-    parser = argparse.ArgumentParser(
-        description="Simulation NTA - Nanoparticle Tracking Analysis (Dark Field Scattering)"
-    )
-    parser.add_argument("--radius", type=float, default=100.0,
-                       help="Rayon de la particule [nm]")
-    parser.add_argument("--roughness", type=float, default=5.0,
-                       help="Amplitude RMS de la rugosité [nm]")
-    parser.add_argument("--lmax", type=int, default=10,
-                       help="Ordre max des harmoniques sphériques")
-    parser.add_argument("--n-particle", type=float, default=1.50,
-                       help="Indice de réfraction")
-    parser.add_argument("--wavelength", type=float, default=532.0,
-                       help="Longueur d'onde du laser [nm]")
-    parser.add_argument("--na", type=float, default=0.4,
-                       help="Ouverture numérique")
-    parser.add_argument("--pixels", type=int, default=256,
-                       help="Taille de l'image [pixels]")
-    parser.add_argument("--save", type=str, default="nta_comparison.png",
-                       help="Fichier de sortie")
-    parser.add_argument("--no-save", action="store_true",
-                       help="Ne pas sauvegarder")
-    parser.add_argument("--demo-d6", action="store_true",
-                       help="Lancer la démonstration de l'effet d⁶")
-    
-    args = parser.parse_args()
-    
-    if args.demo_d6:
+    # Utilise les hyperparamètres définis en début de fichier
+    if HYPERPARAMS['demo_d6']:
         demo_d6_effect(
-            wavelength_nm=args.wavelength,
-            numerical_aperture=args.na,
-            save_path=None if args.no_save else "nta_d6_demo.png"
+            wavelength_nm=HYPERPARAMS['wavelength_nm'],
+            numerical_aperture=HYPERPARAMS['numerical_aperture'],
+            save_path='nta_d6_demo.png' if HYPERPARAMS['save_path'] else None
         )
     else:
         run_comparison(
-            radius_nm=args.radius,
-            roughness_nm=args.roughness,
-            roughness_lmax=args.lmax,
-            refractive_index=args.n_particle,
-            wavelength_nm=args.wavelength,
-            numerical_aperture=args.na,
-            image_pixels=args.pixels,
-            save_path=None if args.no_save else args.save
+            radius_nm=HYPERPARAMS['radius_nm'],
+            roughness_nm=HYPERPARAMS['roughness_nm'],
+            roughness_lmax=HYPERPARAMS['roughness_lmax'],
+            refractive_index=HYPERPARAMS['refractive_index'],
+            wavelength_nm=HYPERPARAMS['wavelength_nm'],
+            numerical_aperture=HYPERPARAMS['numerical_aperture'],
+            image_pixels=HYPERPARAMS['image_pixels'],
+            save_path=HYPERPARAMS['save_path']
         )

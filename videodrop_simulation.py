@@ -17,6 +17,31 @@ Principe physique :
 ===============================================================================
 """
 
+# =============================================================================
+# HYPERPARAMÈTRES DE SIMULATION
+# =============================================================================
+# Modifier ces valeurs pour changer les paramètres de simulation
+
+HYPERPARAMS = {
+    # Particule
+    'radius_nm': 60.0,              # Rayon de la particule [nm]
+    'roughness_nm': 10.0,           # Amplitude RMS de la rugosité [nm]
+    'roughness_lmax': 10,           # Ordre max des harmoniques sphériques
+    'refractive_index': 1.50,       # Indice de réfraction (polystyrène)
+    
+    # Optique
+    'wavelength_nm': 488.0,         # Longueur d'onde LED [nm]
+    'numerical_aperture': 0.3,      # Ouverture numérique
+    
+    # Image
+    'image_pixels': 256,            # Résolution de l'image [pixels]
+    
+    # Sauvegarde
+    'save_path': 'videodrop_comparison.png',  # Fichier de sortie (None = pas de sauvegarde)
+}
+
+# =============================================================================
+
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
@@ -879,39 +904,14 @@ COMPARAISON SPECTRALE:
 # =============================================================================
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description="Simulation Videodrop - Comparaison particule lisse vs rugueuse"
-    )
-    parser.add_argument("--radius", type=float, default=80.0,
-                       help="Rayon de la particule [nm]")
-    parser.add_argument("--roughness", type=float, default=5.0,
-                       help="Amplitude RMS de la rugosité [nm]")
-    parser.add_argument("--lmax", type=int, default=10,
-                       help="Ordre max des harmoniques sphériques")
-    parser.add_argument("--n-particle", type=float, default=1.50,
-                       help="Indice de réfraction")
-    parser.add_argument("--wavelength", type=float, default=488.0,
-                       help="Longueur d'onde [nm]")
-    parser.add_argument("--na", type=float, default=0.3,
-                       help="Ouverture numérique")
-    parser.add_argument("--pixels", type=int, default=256,
-                       help="Taille de l'image [pixels]")
-    parser.add_argument("--save", type=str, default="videodrop_comparison.png",
-                       help="Fichier de sortie")
-    parser.add_argument("--no-save", action="store_true",
-                       help="Ne pas sauvegarder")
-    
-    args = parser.parse_args()
-    
+    # Utilise les hyperparamètres définis en début de fichier
     run_comparison(
-        radius_nm=args.radius,
-        roughness_nm=args.roughness,
-        roughness_lmax=args.lmax,
-        refractive_index=args.n_particle,
-        wavelength_nm=args.wavelength,
-        numerical_aperture=args.na,
-        image_pixels=args.pixels,
-        save_path=None if args.no_save else args.save
+        radius_nm=HYPERPARAMS['radius_nm'],
+        roughness_nm=HYPERPARAMS['roughness_nm'],
+        roughness_lmax=HYPERPARAMS['roughness_lmax'],
+        refractive_index=HYPERPARAMS['refractive_index'],
+        wavelength_nm=HYPERPARAMS['wavelength_nm'],
+        numerical_aperture=HYPERPARAMS['numerical_aperture'],
+        image_pixels=HYPERPARAMS['image_pixels'],
+        save_path=HYPERPARAMS['save_path']
     )
