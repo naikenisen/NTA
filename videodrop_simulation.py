@@ -7,18 +7,12 @@ VIDEODROP SIMULATION - Interferometric Brightfield Nanoparticle Imaging
 Simulation d'une image de caméra pour la microscopie interférométrique
 en champ clair (type Videodrop / Myriade).
 
+Comparaison : Particule lisse vs Particule rugueuse
+
 Principe physique :
 - Illumination en transmission (LED)
 - Interférence entre l'onde directe et l'onde diffusée par la particule
 - Détection : I = |E_ref + E_scat|²
-
-Signal :
-  I = |E_ref|² + |E_scat|² + 2·Re(E_ref* · E_scat)
-      ↑           ↑              ↑
-   fond clair   très petit   TERME D'INTERFÉRENCE (dominant!)
-
-Avantage : Sensibilité en r³ (pas r⁶ comme en dark-field)
-Résultat : Tache sombre ou claire sur fond clair selon la phase
 
 ===============================================================================
 """
@@ -29,6 +23,14 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 import warnings
 
+# Pour les harmoniques sphériques (rugosité)
+try:
+    from scipy.special import sph_harm_y
+    USE_NEW_SCIPY = True
+except ImportError:
+    from scipy.special import sph_harm
+    USE_NEW_SCIPY = False
+
 
 # =============================================================================
 # CONSTANTES PHYSIQUES
@@ -37,8 +39,8 @@ import warnings
 @dataclass
 class PhysicalConstants:
     """Constantes physiques pour la simulation."""
-    wavelength_nm: float = 488.0     # Longueur d'onde LED [nm]
-    n_water: float = 1.33            # Indice de réfraction de l'eau
+    wavelength_nm: float = 488.0
+    n_water: float = 1.33
     
     @property
     def wavelength_um(self) -> float:
@@ -60,17 +62,23 @@ class PhysicalConstants:
 @dataclass
 class ParticleParameters:
     """Paramètres de la nanoparticule."""
-    radius_nm: float = 80.0              # Rayon [nm]
-    refractive_index: float = 1.50       # Indice de réfraction
-    material_name: str = "polystyrene"   # Nom du matériau
+    radius_nm: float = 80.0
+    refractive_index: float = 1.50
+    roughness_amplitude_nm: float = 0.0   # Amplitude RMS de la rugosité
+    roughness_lmax: int = 10              # Ordre max des harmoniques sphériques
+    roughness_seed: int = 42              # Seed pour reproductibilité
+    material_name: str = "polystyrene"
     
     @property
     def radius_um(self) -> float:
         return self.radius_nm / 1000.0
     
     @property
+    def roughness_amplitude_um(self) -> float:
+        return self.roughness_amplitude_nm / 1000.0
+    
+    @property
     def size_parameter(self) -> float:
-        """Paramètre de taille de Mie x = 2πr/λ"""
         constants = PhysicalConstants()
         return 2 * np.pi * self.radius_nm / (constants.wavelength_nm / constants.n_water)
     
@@ -86,36 +94,102 @@ class ParticleParameters:
 
 
 # =============================================================================
-# PARAMÈTRES D'ILLUMINATION
+# GÉOMÉTRIE DE PARTICULE RUGUEUSE
+# =============================================================================
+
+class RoughParticleGeometry:
+    """
+    Génère une géométrie de particule rugueuse avec harmoniques sphériques.
+    
+    r(θ,φ) = R + δr(θ,φ)
+    δr = Σ a_lm · Y_lm(θ,φ)
+    """
+    
+    def __init__(self, params: ParticleParameters):
+        self.params = params
+        self.rng = np.random.default_rng(params.roughness_seed)
+        self._generate_roughness_coefficients()
+    
+    def _generate_roughness_coefficients(self):
+        """Génère les coefficients des harmoniques sphériques."""
+        lmax = self.params.roughness_lmax
+        amplitude = self.params.roughness_amplitude_um
+        
+        if amplitude == 0:
+            self.alm = {}
+            return
+        
+        l_corr = max(lmax / 3, 1)
+        self.alm = {}
+        total_power = 0
+        
+        for l in range(2, lmax + 1):
+            power_l = np.exp(-l / l_corr)
+            for m in range(-l, l + 1):
+                if m == 0:
+                    self.alm[(l, m)] = self.rng.normal(0, np.sqrt(power_l))
+                else:
+                    re = self.rng.normal(0, np.sqrt(power_l / 2))
+                    im = self.rng.normal(0, np.sqrt(power_l / 2))
+                    self.alm[(l, m)] = complex(re, im)
+                total_power += np.abs(self.alm[(l, m)])**2
+        
+        if total_power > 0:
+            norm_factor = amplitude / np.sqrt(total_power)
+            for key in self.alm:
+                self.alm[key] *= norm_factor
+    
+    def radius_at_angles(self, theta: np.ndarray, phi: np.ndarray) -> np.ndarray:
+        """Calcule le rayon local r(θ,φ)."""
+        r = np.ones_like(theta) * self.params.radius_um
+        
+        if self.params.roughness_amplitude_nm == 0:
+            return r
+        
+        for (l, m), coeff in self.alm.items():
+            if USE_NEW_SCIPY:
+                Ylm = sph_harm_y(l, m, theta, phi)
+            else:
+                Ylm = sph_harm(m, l, phi, theta)
+            r += np.real(coeff * Ylm)
+        
+        return r
+    
+    def generate_surface_mesh(self, n_theta: int = 50, n_phi: int = 100) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Génère le maillage 3D de la surface."""
+        theta = np.linspace(0, np.pi, n_theta)
+        phi = np.linspace(0, 2 * np.pi, n_phi)
+        THETA, PHI = np.meshgrid(theta, phi, indexing='ij')
+        
+        R = self.radius_at_angles(THETA, PHI)
+        
+        X = R * np.sin(THETA) * np.cos(PHI)
+        Y = R * np.sin(THETA) * np.sin(PHI)
+        Z = R * np.cos(THETA)
+        
+        return X, Y, Z
+
+
+# =============================================================================
+# PARAMÈTRES D'ILLUMINATION ET D'IMAGERIE
 # =============================================================================
 
 @dataclass
 class IlluminationParameters:
-    """Paramètres de l'illumination LED."""
     wavelength_nm: float = 488.0
     polarization: str = "x"
-    
-    @property
-    def frequency_meep(self) -> float:
-        return 1.0 / (self.wavelength_nm / 1000.0)
 
-
-# =============================================================================
-# PARAMÈTRES D'IMAGERIE
-# =============================================================================
 
 @dataclass
 class ImagingParameters:
-    """Paramètres du système d'imagerie."""
     numerical_aperture: float = 0.3
-    magnification: float = 20.0
+    magnification: float = 200.0            # Fort zoom sur la particule
     camera_pixel_size_um: float = 6.5
-    image_pixels: int = 64
-    
-    # Paramètres d'interférométrie (Videodrop)
-    reference_amplitude: float = 1.0      # Amplitude du faisceau de référence
-    reference_phase: float = 0.0          # Phase de référence [rad]
-    background_subtraction: bool = True   # Soustraire |E_ref|²
+    image_pixels: int = 256                  # Résolution augmentée
+    reference_amplitude: float = 1.0
+    defocus_um: float = 1.0                  # Plus de défocus pour étaler le halo
+    camera_noise_level: float = 0.005        # Moins de bruit
+    background_level: int = 180
     
     @property
     def object_pixel_size_um(self) -> float:
@@ -135,15 +209,7 @@ class ImagingParameters:
 # =============================================================================
 
 class VideodropSimulation:
-    """
-    Simulation d'imagerie interférométrique type Videodrop.
-    
-    Workflow :
-    1. Calculer la diffusion de la nanoparticule (Rayleigh/Mie)
-    2. Appliquer le filtre NA de l'objectif
-    3. Calculer l'interférence avec le faisceau de référence
-    4. Générer l'image caméra
-    """
+    """Simulation d'imagerie interférométrique type Videodrop."""
     
     def __init__(
         self,
@@ -155,16 +221,14 @@ class VideodropSimulation:
         self.illumination = illumination
         self.imaging = imaging
         self.constants = PhysicalConstants(wavelength_nm=illumination.wavelength_nm)
+        self.geometry = RoughParticleGeometry(particle)
         
-        # Données de simulation
         self._far_field_data = None
         self._camera_image = None
         self._interferometry_data = None
     
     def _compute_scattering(self):
-        """
-        Calcule le champ diffusé (modèle Rayleigh/Mie simplifié).
-        """
+        """Calcule le champ diffusé."""
         n_theta = 90
         n_phi = 180
         
@@ -172,7 +236,7 @@ class VideodropSimulation:
         phi = np.linspace(0, 2*np.pi, n_phi)
         THETA, PHI = np.meshgrid(theta, phi, indexing='ij')
         
-        # Pattern angulaire dipôle (polarisation x)
+        # Pattern angulaire dipôle
         if self.illumination.polarization == "x":
             angular_pattern = np.sqrt(np.maximum(1.0 - np.sin(THETA)**2 * np.cos(PHI)**2, 0.01))
         else:
@@ -189,6 +253,21 @@ class VideodropSimulation:
         # Phase de diffusion
         base_phase = PHI
         scattering_phase = np.angle(complex(polarizability_factor))
+        
+        # Effets de rugosité : perturbations de phase et amplitude
+        if self.particle.roughness_amplitude_nm > 0:
+            np.random.seed(self.particle.roughness_seed)
+            roughness_factor = self.particle.roughness_amplitude_nm / self.particle.radius_nm
+            
+            amplitude_noise = np.random.randn(n_theta, n_phi) * roughness_factor * 0.3
+            phase_noise = np.random.randn(n_theta, n_phi) * roughness_factor * np.pi
+            
+            from scipy.ndimage import gaussian_filter
+            amplitude_noise = gaussian_filter(amplitude_noise, sigma=2)
+            phase_noise = gaussian_filter(phase_noise, sigma=2)
+            
+            E_amplitude = E_amplitude * (1 + amplitude_noise)
+            base_phase = base_phase + phase_noise
         
         # Champ complexe
         E_theta = E_amplitude * np.exp(1j * (base_phase + scattering_phase))
@@ -208,335 +287,631 @@ class VideodropSimulation:
     
     def generate_camera_image(self) -> np.ndarray:
         """
-        Génère l'image caméra avec détection interférométrique.
+        Génère l'image caméra avec détection interférométrique type Videodrop.
         
-        I = |E_ref + E_scat|² = |E_ref|² + |E_scat|² + 2·Re(E_ref* · E_scat)
+        Physique implémentée :
+        1. Onde incidente Ei : onde plane uniforme (LED collimatée)
+        2. Onde diffusée Es : diffusion Rayleigh, onde sphérique avec déphasage
+        3. Déphasage : déterminé par la polarisabilité complexe α = (m²-1)/(m²+2)
+        4. Interférence : I = |Ei + Es|² = |Ei|² + |Es|² + 2·Re(Ei·Es*)
+        5. Amplification homodyne : le terme croisé 2·Re(Ei·Es*) domine
+        6. Imagerie : propagation vers le plan image avec PSF du système
         """
         if self._far_field_data is None:
             self._compute_scattering()
         
-        ff = self._far_field_data
-        theta = ff['theta']
-        phi = ff['phi']
-        
         N = self.imaging.image_pixels
         fov = self.imaging.field_of_view_um
         NA = self.imaging.numerical_aperture
-        theta_max = self.imaging.max_collection_angle_rad
+        defocus = self.imaging.defocus_um
+        background_level = self.imaging.background_level
+        noise_level = self.imaging.camera_noise_level
         
-        E_ref_amplitude = self.imaging.reference_amplitude
-        E_ref_phase = self.imaging.reference_phase
-        background_subtraction = self.imaging.background_subtraction
-        
-        print(f"Génération image Videodrop ({N}x{N} pixels, NA={NA})...")
-        print(f"  Référence: amplitude={E_ref_amplitude}, phase={np.degrees(E_ref_phase):.1f}°")
-        
-        # Grille image
-        x_img = np.linspace(-fov/2, fov/2, N)
-        y_img = np.linspace(-fov/2, fov/2, N)
-        X_IMG, Y_IMG = np.meshgrid(x_img, y_img, indexing='ij')
-        
-        # Direction caméra (axe y)
-        cam_dir = np.array([0, 1, 0])
-        
-        # Directions de diffusion
-        dirs_x = np.sin(theta) * np.cos(phi)
-        dirs_y = np.sin(theta) * np.sin(phi)
-        dirs_z = np.cos(theta)
-        
-        # Angle par rapport à l'axe caméra
-        cos_angle_to_cam = dirs_x * cam_dir[0] + dirs_y * cam_dir[1] + dirs_z * cam_dir[2]
-        angle_to_cam = np.arccos(np.clip(cos_angle_to_cam, -1, 1))
-        
-        # Masque NA
-        in_na_cone = angle_to_cam <= theta_max
-        
-        # Champ diffusé collecté
-        E_scat_collected = np.sqrt(ff['intensity']) * in_na_cone
-        E_scat_total = np.mean(E_scat_collected)
-        
-        # Champ diffusé complexe moyen dans le cône NA
-        E_theta = ff['E_theta']
-        E_phi = ff['E_phi']
-        E_scat_collected = np.mean(E_theta[in_na_cone]) + np.mean(E_phi[in_na_cone])
-        
-        # PSF (Point Spread Function) - approximation gaussienne
+        # Paramètres optiques
         wavelength = self.constants.wavelength_um
-        sigma_psf = 0.42 * wavelength / NA  # Largeur gaussienne de la PSF
-        R_IMG = np.sqrt(X_IMG**2 + Y_IMG**2)
+        n_medium = self.constants.n_water
+        k = 2 * np.pi * n_medium / wavelength  # Nombre d'onde dans le milieu
         
-        # Amplitude de la PSF (gaussienne)
-        psf_amplitude = np.exp(-R_IMG**2 / (4 * sigma_psf**2))
+        # Grille image (plan du capteur, coordonnées dans l'espace objet)
+        pixel_size = fov / N
+        x = np.linspace(-fov/2, fov/2, N)
+        y = np.linspace(-fov/2, fov/2, N)
+        X, Y = np.meshgrid(x, y, indexing='ij')
+        R = np.sqrt(X**2 + Y**2)  # Distance radiale au centre (position particule)
         
-        # Courbure de phase (Gouy + défocus)
-        k = 2 * np.pi / wavelength * self.constants.n_water
-        phase_curvature = k * R_IMG**2 / (4 * fov)
+        # =====================================================================
+        # 1. ONDE INCIDENTE (Référence) : Onde plane uniforme
+        # =====================================================================
+        # LED collimatée → front d'onde plan, amplitude constante
+        E_i_amplitude = self.imaging.reference_amplitude
+        E_i = E_i_amplitude * np.ones((N, N), dtype=complex)
         
-        # Champ diffusé sur l'image
-        E_scat = E_scat_collected * psf_amplitude * np.exp(1j * phase_curvature)
+        # =====================================================================
+        # 2. POLARISABILITÉ ET DÉPHASAGE (Physique de la diffusion)
+        # =====================================================================
+        # Indice relatif m = n_particule / n_milieu
+        m = self.particle.refractive_index / n_medium
         
-        # Champ de référence (Videodrop : lumière directe transmise)
-        E_ref = E_ref_amplitude * np.exp(1j * E_ref_phase) * psf_amplitude
+        # Polarisabilité complexe (Clausius-Mossotti)
+        # α = (m² - 1) / (m² + 2)
+        # Pour polystyrène (n=1.50) dans eau (n=1.33): m ≈ 1.128
+        # → α est RÉEL et POSITIF pour les diélectriques
+        polarizability = (m**2 - 1) / (m**2 + 2)
         
-        # =================================================================
-        # SIGNAL INTERFÉROMÉTRIQUE (cœur du Videodrop)
-        # =================================================================
-        # I = |E_ref + E_scat|² = |E_ref|² + |E_scat|² + 2·Re(E_ref* · E_scat)
+        # Le déphasage intrinsèque de la diffusion Rayleigh
+        # Pour un dipôle oscillant : déphasage de π/2 par rapport au champ incident
+        # PLUS la phase de la polarisabilité
+        intrinsic_phase = np.angle(polarizability) + np.pi/2
         
-        E_total = E_ref + E_scat
+        # =====================================================================
+        # 3. AMPLITUDE DE DIFFUSION RAYLEIGH
+        # =====================================================================
+        r_particle = self.particle.radius_um
+        
+        # Amplitude de diffusion Rayleigh : E_s ∝ k² · r³ · α
+        # Le facteur k² vient de la radiation du dipôle
+        scattering_strength = (k**2) * (r_particle**3) * np.abs(polarizability)
+        
+        # =====================================================================
+        # 4. PROPAGATION DE L'ONDE DIFFUSÉE VERS LE CAPTEUR
+        # =====================================================================
+        # L'onde diffusée est sphérique, mais après passage par l'objectif,
+        # elle devient une onde convergente/divergente selon le défocus
+        
+        # Rayon d'Airy (résolution du système optique)
+        airy_radius = 0.61 * wavelength / NA
+        
+        # Paramètre de défocus (phase de Gouy incluse)
+        # z > 0 : plan image au-dessus du focus (particule floue, halo externe clair)
+        # z < 0 : plan image en-dessous du focus (particule floue, halo externe sombre)
+        z = defocus
+        
+        # Rayleigh range (profondeur de champ)
+        z_R = np.pi * airy_radius**2 / wavelength
+        
+        # Phase de Gouy : change le signe du contraste selon le défocus
+        gouy_phase = np.arctan(z / z_R) if z_R > 0 else 0
+        
+        # =====================================================================
+        # 5. PSF COMPLEXE AVEC DÉFOCUS (Modèle de Fresnel)
+        # =====================================================================
+        # La PSF défocalisée inclut des anneaux de Fresnel
+        
+        # Paramètre réduit radial
+        rho = R / airy_radius
+        rho_safe = np.maximum(rho, 1e-8)
+        
+        # PSF d'Airy (en focus)
+        from scipy.special import j1
+        airy_amplitude = 2 * j1(np.pi * rho_safe) / (np.pi * rho_safe)
+        airy_amplitude = np.where(rho < 1e-6, 1.0, airy_amplitude)
+        
+        # Phase de défocus quadratique (approximation paraxiale)
+        # Phase ∝ k · z · (r/f)² où f est liée à NA
+        defocus_phase = k * z * (R / (fov/2))**2 * (NA**2) / 2
+        
+        # Fonction pupille avec défocus
+        # Ceci crée les anneaux de Fresnel caractéristiques
+        psf_complex = airy_amplitude * np.exp(1j * defocus_phase)
+        
+        # =====================================================================
+        # 6. CHAMP DIFFUSÉ AU NIVEAU DU CAPTEUR
+        # =====================================================================
+        # E_s = amplitude × exp(i·phase_totale) × PSF
+        
+        # Phase totale de l'onde diffusée
+        total_phase = intrinsic_phase + gouy_phase
+        
+        # Perturbations de phase dues à la rugosité
+        if self.particle.roughness_amplitude_nm > 0:
+            np.random.seed(self.particle.roughness_seed)
+            roughness_factor = self.particle.roughness_amplitude_nm / self.particle.radius_nm
+            from scipy.ndimage import gaussian_filter
+            # La rugosité crée des fluctuations de chemin optique
+            phase_roughness = gaussian_filter(
+                np.random.randn(N, N) * roughness_factor * k * (self.particle.roughness_amplitude_nm/1000), 
+                sigma=3
+            )
+            total_phase = total_phase + phase_roughness
+        
+        # Champ diffusé complet
+        E_s = scattering_strength * psf_complex * np.exp(1j * total_phase)
+        
+        # Facteur d'échelle pour contraste visible (ajustement pour visualisation)
+        # En réalité le contraste serait de ~0.1-1% pour des NP de 80nm
+        visibility_factor = 50.0  # Amplifie pour visualisation
+        E_s = E_s * visibility_factor
+        
+        # =====================================================================
+        # 7. INTERFÉRENCE : I = |Ei + Es|²
+        # =====================================================================
+        E_total = E_i + E_s
         I_total = np.abs(E_total)**2
         
-        # Décomposition
-        I_ref = np.abs(E_ref)**2                              # Fond clair
-        I_scat = np.abs(E_scat)**2                            # Très faible
-        I_interference = 2 * np.real(np.conj(E_ref) * E_scat) # Signal dominant!
+        # Décomposition des termes
+        I_i = np.abs(E_i)**2           # Fond (|Ei|²) - terme dominant
+        I_s = np.abs(E_s)**2           # Intensité diffusée seule (|Es|²) - très faible
+        I_interference = 2 * np.real(np.conj(E_i) * E_s)  # Terme croisé - AMPLIFICATION HOMODYNE
         
-        # Stockage pour analyse
+        # Vérification : I_total ≈ I_i + I_interference (car I_s << I_i)
+        
+        # =====================================================================
+        # 8. CONVERSION EN IMAGE CAPTEUR
+        # =====================================================================
+        # Normalisation : le fond (sans particule) = background_level
+        I_background = np.mean(I_i)
+        I_normalized = I_total / I_background
+        
+        # Image en niveaux de gris
+        I_image = I_normalized * background_level
+        
+        # Bruit du capteur CMOS (shot noise + read noise)
+        np.random.seed(None)
+        shot_noise = np.sqrt(I_image) * np.random.randn(N, N) * 0.02
+        read_noise = np.random.randn(N, N) * noise_level * background_level
+        I_noisy = I_image + shot_noise + read_noise
+        
+        # Clamp aux valeurs valides [0, 255]
+        I_noisy = np.clip(I_noisy, 0, 255)
+        
+        # =====================================================================
+        # STOCKAGE DES DONNÉES D'INTERFÉROMÉTRIE
+        # =====================================================================
+        contrast = np.abs(I_interference).max() / I_background
+        
         self._interferometry_data = {
-            'E_ref': E_ref,
-            'E_scat': E_scat,
-            'I_ref': I_ref,
-            'I_scat': I_scat,
-            'I_interference': I_interference,
-            'I_total': I_total
+            'E_i': E_i,              # Champ incident
+            'E_s': E_s,              # Champ diffusé
+            'I_i': I_i,              # Intensité incidente (fond)
+            'I_s': I_s,              # Intensité diffusée
+            'I_interference': I_interference,  # Terme d'interférence (signal)
+            'I_total': I_total,      # Intensité totale
+            'I_ref': I_i,            # Alias pour compatibilité
+            'I_scat': I_s,           # Alias pour compatibilité
+            'contrast': contrast,    # Contraste de la particule
+            'gouy_phase': gouy_phase,
+            'polarizability': polarizability
         }
         
-        # Soustraction du fond
-        if background_subtraction:
-            I_ref_mean = np.mean(I_ref)
-            camera_signal = I_total - I_ref_mean
-            print(f"  Fond soustrait: I_ref_mean = {I_ref_mean:.4f}")
-        else:
-            camera_signal = I_total
-        
-        self._camera_image = camera_signal
-        
-        # Statistiques
-        print(f"  |E_scat|² max: {np.max(I_scat):.2e}")
-        print(f"  Terme d'interférence max: {np.max(np.abs(I_interference)):.2e}")
-        print(f"  Enhancement: {np.max(np.abs(I_interference))/np.max(I_scat):.1f}x")
-        print(f"Image générée. Max: {np.max(camera_signal):.4e}, Min: {np.min(camera_signal):.4e}")
-        
+        self._camera_image = I_noisy
         return self._camera_image
     
-    def plot_results(self, save_path: Optional[str] = None):
-        """Visualisation des résultats."""
-        if self._camera_image is None:
-            self.generate_camera_image()
-        
-        fig = plt.figure(figsize=(14, 10))
-        
-        fov = self.imaging.field_of_view_um
-        extent = [-fov/2, fov/2, -fov/2, fov/2]
-        N = self.imaging.image_pixels
-        x_coords = np.linspace(-fov/2, fov/2, N)
-        
-        # 1. Image Videodrop (interférométrique)
-        ax1 = fig.add_subplot(2, 3, 1)
-        img = self._camera_image
-        vmax = np.max(np.abs(img))
-        im1 = ax1.imshow(img.T, origin='lower', extent=extent,
-                        cmap='RdBu_r', aspect='equal', vmin=-vmax, vmax=vmax)
-        ax1.set_xlabel('X [μm]')
-        ax1.set_ylabel('Z [μm]')
-        ax1.set_title('Image Videodrop\n(fond soustrait)')
-        plt.colorbar(im1, ax=ax1, label='ΔI')
-        
-        # 2. Profil central
-        ax2 = fig.add_subplot(2, 3, 2)
-        ax2.plot(x_coords, img[N//2, :], 'b-', linewidth=2)
-        ax2.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-        ax2.set_xlabel('Position [μm]')
-        ax2.set_ylabel('ΔIntensité')
-        ax2.set_title('Profil central')
-        ax2.grid(True, alpha=0.3)
-        
-        # 3. Décomposition du signal
-        if self._interferometry_data is not None:
-            ax3 = fig.add_subplot(2, 3, 3)
-            I_scat = self._interferometry_data['I_scat'][N//2, :]
-            I_interf = self._interferometry_data['I_interference'][N//2, :]
-            
-            ax3.plot(x_coords, I_scat, 'r-', linewidth=2, label='|E_scat|²')
-            ax3.plot(x_coords, I_interf, 'b-', linewidth=2, label='2·Re(E_ref*·E_scat)')
-            ax3.set_xlabel('Position [μm]')
-            ax3.set_ylabel('Intensité')
-            ax3.set_title('Décomposition du signal')
-            ax3.legend()
-            ax3.grid(True, alpha=0.3)
-        
-        # 4. |E_scat|² seul (ce qu'on verrait en dark-field)
-        ax4 = fig.add_subplot(2, 3, 4)
-        I_scat_img = self._interferometry_data['I_scat']
-        im4 = ax4.imshow(I_scat_img.T, origin='lower', extent=extent,
-                        cmap='hot', aspect='equal')
-        ax4.set_xlabel('X [μm]')
-        ax4.set_ylabel('Z [μm]')
-        ax4.set_title('Scattering seul (dark-field)\n|E_scat|²')
-        plt.colorbar(im4, ax=ax4, label='I')
-        
-        # 5. Terme d'interférence
-        ax5 = fig.add_subplot(2, 3, 5)
-        I_interf_img = self._interferometry_data['I_interference']
-        vmax_i = np.max(np.abs(I_interf_img))
-        im5 = ax5.imshow(I_interf_img.T, origin='lower', extent=extent,
-                        cmap='RdBu_r', aspect='equal', vmin=-vmax_i, vmax=vmax_i)
-        ax5.set_xlabel('X [μm]')
-        ax5.set_ylabel('Z [μm]')
-        ax5.set_title('Terme d\'interférence\n2·Re(E_ref*·E_scat)')
-        plt.colorbar(im5, ax=ax5, label='ΔI')
-        
-        # 6. Résumé des paramètres
-        ax6 = fig.add_subplot(2, 3, 6)
-        ax6.axis('off')
-        
-        enhancement = np.max(np.abs(I_interf_img)) / np.max(I_scat_img)
-        
-        summary = f"""
-PARAMÈTRES VIDEODROP
-{'='*40}
-
-Particule:
-  • Rayon: {self.particle.radius_nm:.0f} nm
-  • Indice: {self.particle.refractive_index:.2f}
-  • Régime: {self.particle.scattering_regime}
-
-Illumination:
-  • λ = {self.illumination.wavelength_nm:.0f} nm
-
-Imagerie:
-  • NA = {self.imaging.numerical_aperture}
-  • Champ de vue: {fov:.1f} μm
-
-SIGNAL INTERFÉROMÉTRIQUE
-{'='*40}
-
-Principe:
-  I = |E_ref + E_scat|²
-    = |E_ref|² + |E_scat|² + 2·Re(E_ref*·E_scat)
-          ↑          ↑              ↑
-       fond      très petit    SIGNAL DOMINANT
-
-Enhancement: {enhancement:.1f}x
-
-Le terme d'interférence donne une
-sensibilité en r³ (pas r⁶ comme dark-field)
-→ Détection de particules beaucoup 
-  plus petites possible!
-"""
-        ax6.text(0.02, 0.98, summary, transform=ax6.transAxes,
-                fontfamily='monospace', fontsize=9,
-                verticalalignment='top')
-        
-        plt.suptitle(f'Simulation Videodrop - R={self.particle.radius_nm:.0f}nm, '
-                    f'n={self.particle.refractive_index}, λ={self.illumination.wavelength_nm:.0f}nm',
-                    fontsize=12, fontweight='bold')
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Figure sauvegardée: {save_path}")
-        
-        plt.show()
-        return fig
+    def get_surface_mesh(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Retourne le maillage 3D de la particule."""
+        return self.geometry.generate_surface_mesh()
 
 
 # =============================================================================
-# FONCTION PRINCIPALE
+# ANALYSE SPECTRALE (FFT)
 # =============================================================================
 
-def run_videodrop_simulation(
+def compute_spectral_analysis(image: np.ndarray, fov_um: float, subtract_background: bool = True) -> dict:
+    """
+    Calcule l'analyse spectrale 2D (FFT) de l'image.
+    
+    Améliorations :
+    - Soustraction du fond (DC) pour voir les hautes fréquences
+    - Fenêtrage de Hann pour éviter les artefacts de bord
+    - Normalisation appropriée
+    
+    Args:
+        image: Image 2D
+        fov_um: Champ de vue en microns
+        subtract_background: Si True, soustrait le fond moyen (recommandé)
+    
+    Returns:
+        Dict avec PSD 2D, profil radial, fréquences, etc.
+    """
+    N = image.shape[0]
+    pixel_size = fov_um / N
+    
+    # =========================================================================
+    # PRÉTRAITEMENT
+    # =========================================================================
+    
+    # Soustraction du fond (enlève le pic DC)
+    if subtract_background:
+        image_centered = image - np.mean(image)
+    else:
+        image_centered = image.copy()
+    
+    # Fenêtrage 2D de Hann (réduit les artefacts de bord)
+    hann_1d = np.hanning(N)
+    hann_2d = np.outer(hann_1d, hann_1d)
+    image_windowed = image_centered * hann_2d
+    
+    # =========================================================================
+    # FFT 2D
+    # =========================================================================
+    
+    # Fréquences spatiales
+    freq = np.fft.fftfreq(N, d=pixel_size)
+    freq_shift = np.fft.fftshift(freq)
+    FX, FY = np.meshgrid(freq_shift, freq_shift, indexing='ij')
+    
+    # FFT 2D avec shift pour centrer le DC
+    fft_img = np.fft.fftshift(np.fft.fft2(image_windowed))
+    
+    # Power Spectral Density
+    psd = np.abs(fft_img)**2
+    
+    # Normalisation : par rapport à l'énergie totale (pas le max)
+    psd_norm = psd / (np.sum(psd) + 1e-20) * N * N
+    
+    # =========================================================================
+    # PROFIL RADIAL (moyenne azimutale)
+    # =========================================================================
+    
+    center = N // 2
+    y_idx, x_idx = np.indices(psd.shape)
+    r = np.sqrt((x_idx - center)**2 + (y_idx - center)**2)
+    r_int = r.astype(int)
+    r_max = min(center, N - center)
+    
+    # Moyenne azimutale plus robuste
+    radial_profile = np.zeros(r_max)
+    radial_std = np.zeros(r_max)
+    
+    for i in range(r_max):
+        mask = (r_int == i)
+        if np.any(mask):
+            values = psd_norm[mask]
+            radial_profile[i] = np.mean(values)
+            radial_std[i] = np.std(values)
+    
+    # Fréquence radiale correspondante
+    freq_step = freq_shift[1] - freq_shift[0] if len(freq_shift) > 1 else 1.0
+    freq_radial = np.arange(r_max) * freq_step
+    
+    # =========================================================================
+    # MÉTRIQUES SPECTRALES
+    # =========================================================================
+    
+    # Fréquence médiane (où se trouve 50% de l'énergie)
+    cumsum = np.cumsum(radial_profile)
+    if cumsum[-1] > 0:
+        freq_median_idx = np.searchsorted(cumsum, cumsum[-1] / 2)
+        freq_median = freq_radial[min(freq_median_idx, len(freq_radial)-1)]
+    else:
+        freq_median = 0
+    
+    # Largeur spectrale (écart-type pondéré)
+    if np.sum(radial_profile) > 0:
+        freq_mean = np.sum(freq_radial * radial_profile) / np.sum(radial_profile)
+        freq_width = np.sqrt(np.sum((freq_radial - freq_mean)**2 * radial_profile) / np.sum(radial_profile))
+    else:
+        freq_mean = 0
+        freq_width = 0
+    
+    return {
+        'psd_2d': psd_norm,
+        'psd_2d_log': np.log10(psd_norm + 1e-10),
+        'radial_profile': radial_profile,
+        'radial_std': radial_std,
+        'freq_radial': freq_radial,
+        'freq_2d': (FX, FY),
+        'extent': [freq_shift.min(), freq_shift.max(), freq_shift.min(), freq_shift.max()],
+        'freq_median': freq_median,
+        'freq_mean': freq_mean,
+        'freq_width': freq_width,
+        'total_power': np.sum(psd)
+    }
+
+
+# =============================================================================
+# COMPARAISON LISSE vs RUGUEUSE
+# =============================================================================
+
+def run_comparison(
     radius_nm: float = 80.0,
+    roughness_nm: float = 5.0,
+    roughness_lmax: int = 10,
     refractive_index: float = 1.50,
     wavelength_nm: float = 488.0,
     numerical_aperture: float = 0.3,
-    reference_amplitude: float = 1.0,
     image_pixels: int = 64,
     save_path: Optional[str] = None
-) -> VideodropSimulation:
+):
     """
-    Lance une simulation Videodrop complète.
+    Lance une comparaison entre particule lisse et rugueuse.
     
-    Args:
-        radius_nm: Rayon de la particule [nm]
-        refractive_index: Indice de réfraction de la particule
-        wavelength_nm: Longueur d'onde de la LED [nm]
-        numerical_aperture: Ouverture numérique de l'objectif
-        reference_amplitude: Amplitude du faisceau de référence
-        image_pixels: Taille de l'image en pixels
-        save_path: Chemin pour sauvegarder la figure
-    
-    Returns:
-        Instance de VideodropSimulation avec les résultats
+    Génère une figure avec 2 colonnes (lisse / rugueuse) et 3 lignes :
+    1. Représentation 3D de la particule
+    2. Image Videodrop (noir et blanc)
+    3. Analyse spectrale (FFT)
     """
-    print("=" * 60)
-    print("SIMULATION VIDEODROP")
-    print("=" * 60)
+    print("=" * 70)
+    print("SIMULATION VIDEODROP : COMPARAISON LISSE vs RUGUEUSE")
+    print("=" * 70)
     
-    particle = ParticleParameters(
-        radius_nm=radius_nm,
-        refractive_index=refractive_index
-    )
-    
-    illumination = IlluminationParameters(
-        wavelength_nm=wavelength_nm
-    )
-    
+    illumination = IlluminationParameters(wavelength_nm=wavelength_nm)
     imaging = ImagingParameters(
         numerical_aperture=numerical_aperture,
-        image_pixels=image_pixels,
-        reference_amplitude=reference_amplitude
+        image_pixels=image_pixels
     )
     
-    print(f"Particule: R={radius_nm}nm, n={refractive_index}")
-    print(f"Régime: {particle.scattering_regime}")
-    print(f"λ={wavelength_nm}nm, NA={numerical_aperture}")
-    print("-" * 60)
+    # --- PARTICULE LISSE ---
+    print("\n[1/2] Simulation particule LISSE...")
+    particle_smooth = ParticleParameters(
+        radius_nm=radius_nm,
+        refractive_index=refractive_index,
+        roughness_amplitude_nm=0.0,
+        material_name="polystyrene (lisse)"
+    )
+    sim_smooth = VideodropSimulation(particle_smooth, illumination, imaging)
+    sim_smooth.generate_camera_image()
+    X_s, Y_s, Z_s = sim_smooth.get_surface_mesh()
     
-    sim = VideodropSimulation(
-        particle=particle,
-        illumination=illumination,
-        imaging=imaging
+    # --- PARTICULE RUGUEUSE ---
+    print("[2/2] Simulation particule RUGUEUSE...")
+    particle_rough = ParticleParameters(
+        radius_nm=radius_nm,
+        refractive_index=refractive_index,
+        roughness_amplitude_nm=roughness_nm,
+        roughness_lmax=roughness_lmax,
+        material_name="polystyrene (rugueuse)"
+    )
+    sim_rough = VideodropSimulation(particle_rough, illumination, imaging)
+    sim_rough.generate_camera_image()
+    X_r, Y_r, Z_r = sim_rough.get_surface_mesh()
+    
+    # --- ANALYSE SPECTRALE ---
+    print("\nAnalyse spectrale...")
+    fov = imaging.field_of_view_um
+    spectral_smooth = compute_spectral_analysis(sim_smooth._camera_image, fov)
+    spectral_rough = compute_spectral_analysis(sim_rough._camera_image, fov)
+    
+    # =================================================================
+    # CRÉATION DE LA FIGURE
+    # =================================================================
+    print("\nGénération de la figure...")
+    
+    fig = plt.figure(figsize=(12, 18))
+    
+    # Paramètres communs
+    extent_img = [-fov/2, fov/2, -fov/2, fov/2]
+    max_r = particle_smooth.radius_um * 1.3
+    
+    # =====================================================================
+    # LIGNE 1 : GÉOMÉTRIE 3D
+    # =====================================================================
+    
+    # Colonne 1 : Particule lisse
+    ax1 = fig.add_subplot(4, 2, 1, projection='3d')
+    ax1.plot_surface(X_s * 1000, Y_s * 1000, Z_s * 1000, 
+                     cmap='Blues', alpha=0.9, edgecolor='none')
+    ax1.set_xlabel('X [nm]')
+    ax1.set_ylabel('Y [nm]')
+    ax1.set_zlabel('Z [nm]')
+    ax1.set_title('Particule LISSE\n(sphère parfaite)', fontweight='bold')
+    lim = radius_nm * 1.3
+    ax1.set_xlim([-lim, lim])
+    ax1.set_ylim([-lim, lim])
+    ax1.set_zlim([-lim, lim])
+    ax1.set_box_aspect([1, 1, 1])
+    
+    # Colonne 2 : Particule rugueuse
+    ax2 = fig.add_subplot(4, 2, 2, projection='3d')
+    ax2.plot_surface(X_r * 1000, Y_r * 1000, Z_r * 1000, 
+                     cmap='Oranges', alpha=0.9, edgecolor='none')
+    ax2.set_xlabel('X [nm]')
+    ax2.set_ylabel('Y [nm]')
+    ax2.set_zlabel('Z [nm]')
+    ax2.set_title(f'Particule RUGUEUSE\n(σ={roughness_nm}nm, l_max={roughness_lmax})', fontweight='bold')
+    ax2.set_xlim([-lim, lim])
+    ax2.set_ylim([-lim, lim])
+    ax2.set_zlim([-lim, lim])
+    ax2.set_box_aspect([1, 1, 1])
+    
+    # =====================================================================
+    # LIGNE 2 : IMAGES VIDEODROP (NOIR ET BLANC) - RENDU RÉALISTE
+    # =====================================================================
+    
+    img_smooth = sim_smooth._camera_image
+    img_rough = sim_rough._camera_image
+    
+    # Affichage avec contraste ajusté pour voir les détails
+    # On centre sur le fond et on étend pour voir la particule
+    all_pixels = np.concatenate([img_smooth.ravel(), img_rough.ravel()])
+    vmin = np.min(all_pixels) - 5
+    vmax = np.max(all_pixels) + 5
+    
+    # Colonne 1 : Image lisse
+    ax3 = fig.add_subplot(4, 2, 3)
+    im3 = ax3.imshow(img_smooth.T, origin='lower', extent=extent_img,
+                     cmap='gray', aspect='equal', vmin=vmin, vmax=vmax)
+    ax3.set_xlabel('X [μm]')
+    ax3.set_ylabel('Z [μm]')
+    ax3.set_title('Image Videodrop - LISSE', fontweight='bold')
+    plt.colorbar(im3, ax=ax3, label='Intensité', shrink=0.8)
+    
+    # Colonne 2 : Image rugueuse
+    ax4 = fig.add_subplot(4, 2, 4)
+    im4 = ax4.imshow(img_rough.T, origin='lower', extent=extent_img,
+                     cmap='gray', aspect='equal', vmin=vmin, vmax=vmax)
+    ax4.set_xlabel('X [μm]')
+    ax4.set_ylabel('Z [μm]')
+    ax4.set_title('Image Videodrop - RUGUEUSE', fontweight='bold')
+    plt.colorbar(im4, ax=ax4, label='Intensité', shrink=0.8)
+    
+    # =====================================================================
+    # LIGNE 3 : ANALYSE SPECTRALE (FFT)
+    # =====================================================================
+    
+    # Limites dynamiques pour l'affichage du spectre
+    psd_smooth_log = spectral_smooth['psd_2d_log']
+    psd_rough_log = spectral_rough['psd_2d_log']
+    vmin_spec = min(np.percentile(psd_smooth_log, 5), np.percentile(psd_rough_log, 5))
+    vmax_spec = max(np.percentile(psd_smooth_log, 99), np.percentile(psd_rough_log, 99))
+    
+    # Colonne 1 : Spectre lisse
+    ax5 = fig.add_subplot(4, 2, 5)
+    extent_freq = spectral_smooth['extent']
+    im5 = ax5.imshow(psd_smooth_log.T, 
+                     origin='lower', extent=extent_freq,
+                     cmap='inferno', aspect='equal', vmin=vmin_spec, vmax=vmax_spec)
+    ax5.set_xlabel('$f_x$ [cycles/μm]')
+    ax5.set_ylabel('$f_y$ [cycles/μm]')
+    ax5.set_title(f'Spectre FFT - LISSE\n(f_moy={spectral_smooth["freq_mean"]:.2f} cyc/μm)', fontweight='bold')
+    plt.colorbar(im5, ax=ax5, label='log₁₀(PSD)', shrink=0.8)
+    
+    # Cercle de coupure NA
+    f_cutoff = numerical_aperture / (wavelength_nm / 1000)
+    theta_c = np.linspace(0, 2*np.pi, 100)
+    ax5.plot(f_cutoff * np.cos(theta_c), f_cutoff * np.sin(theta_c), 
+             'w--', linewidth=1.5, label=f'NA cutoff')
+    
+    # Colonne 2 : Spectre rugueux
+    ax6 = fig.add_subplot(4, 2, 6)
+    im6 = ax6.imshow(psd_rough_log.T, 
+                     origin='lower', extent=extent_freq,
+                     cmap='inferno', aspect='equal', vmin=vmin_spec, vmax=vmax_spec)
+    ax6.set_xlabel('$f_x$ [cycles/μm]')
+    ax6.set_ylabel('$f_y$ [cycles/μm]')
+    ax6.set_title(f'Spectre FFT - RUGUEUSE\n(f_moy={spectral_rough["freq_mean"]:.2f} cyc/μm)', fontweight='bold')
+    plt.colorbar(im6, ax=ax6, label='log₁₀(PSD)', shrink=0.8)
+    ax6.plot(f_cutoff * np.cos(theta_c), f_cutoff * np.sin(theta_c), 
+             'w--', linewidth=1.5)
+    
+    # =====================================================================
+    # LIGNE 4 : COMPARAISON SPECTRALE (PROFILS RADIAUX)
+    # =====================================================================
+    
+    ax7 = fig.add_subplot(4, 1, 4)
+    
+    freq_s = spectral_smooth['freq_radial']
+    radial_s = spectral_smooth['radial_profile']
+    radial_s_std = spectral_smooth['radial_std']
+    freq_r = spectral_rough['freq_radial']
+    radial_r = spectral_rough['radial_profile']
+    radial_r_std = spectral_rough['radial_std']
+    
+    # Plot des profils radiaux en échelle log avec bandes d'erreur
+    ax7.semilogy(freq_s, radial_s + 1e-10, 'b-', linewidth=2, label='Lisse')
+    ax7.fill_between(freq_s, 
+                     np.maximum(radial_s - radial_s_std, 1e-10), 
+                     radial_s + radial_s_std + 1e-10,
+                     alpha=0.2, color='blue')
+    
+    ax7.semilogy(freq_r, radial_r + 1e-10, 'r-', linewidth=2, label='Rugueuse')
+    ax7.fill_between(freq_r, 
+                     np.maximum(radial_r - radial_r_std, 1e-10), 
+                     radial_r + radial_r_std + 1e-10,
+                     alpha=0.2, color='red')
+    
+    # Ligne de coupure NA
+    ax7.axvline(x=f_cutoff, color='gray', linestyle='--', linewidth=1.5, 
+                label=f'Coupure NA ({f_cutoff:.2f} cyc/μm)')
+    
+    # Fréquences moyennes
+    ax7.axvline(x=spectral_smooth['freq_mean'], color='blue', linestyle=':', linewidth=1.5, alpha=0.7)
+    ax7.axvline(x=spectral_rough['freq_mean'], color='red', linestyle=':', linewidth=1.5, alpha=0.7)
+    
+    ax7.set_xlabel('Fréquence spatiale [cycles/μm]', fontsize=11)
+    ax7.set_ylabel('PSD (normalisée)', fontsize=11)
+    ax7.set_title('Comparaison des Spectres : Profil Radial (Moyenne Azimutale)\n'
+                  f'Largeur spectrale: Lisse={spectral_smooth["freq_width"]:.2f}, Rugueuse={spectral_rough["freq_width"]:.2f} cyc/μm', 
+                  fontweight='bold', fontsize=11)
+    ax7.legend(loc='upper right', fontsize=10)
+    ax7.grid(True, alpha=0.3)
+    ax7.set_xlim([0, min(freq_s[-1], f_cutoff * 2)])
+    
+    # Limites Y dynamiques
+    all_radial = np.concatenate([radial_s, radial_r])
+    ymin = max(np.min(all_radial[all_radial > 0]) * 0.1, 1e-8)
+    ymax = np.max(all_radial) * 2
+    ax7.set_ylim([ymin, ymax])
+    
+    # =====================================================================
+    # TITRE GLOBAL
+    # =====================================================================
+    
+    plt.suptitle(
+        f'Simulation Videodrop : Comparaison Lisse vs Rugueuse\n'
+        f'R={radius_nm}nm, n={refractive_index}, λ={wavelength_nm}nm, NA={numerical_aperture}',
+        fontsize=14, fontweight='bold', y=1.02
     )
     
-    sim.generate_camera_image()
-    sim.plot_results(save_path=save_path)
+    plt.tight_layout()
     
-    return sim
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\nFigure sauvegardée: {save_path}")
+    
+    plt.show()
+    
+    # =================================================================
+    # STATISTIQUES
+    # =================================================================
+    print("\n" + "=" * 70)
+    print("STATISTIQUES")
+    print("=" * 70)
+    
+    contrast_smooth = sim_smooth._interferometry_data.get('contrast', 0)
+    contrast_rough = sim_rough._interferometry_data.get('contrast', 0)
+    
+    print(f"""
+PARTICULE LISSE:
+  • Contraste optique: {contrast_smooth*100:.1f}%
+  • Niveau moyen image: {np.mean(img_smooth):.1f} (sur 255)
+  • Min/Max pixels: {np.min(img_smooth):.1f} / {np.max(img_smooth):.1f}
+  • Fréquence spectrale moyenne: {spectral_smooth['freq_mean']:.3f} cyc/μm
+  • Largeur spectrale: {spectral_smooth['freq_width']:.3f} cyc/μm
 
+PARTICULE RUGUEUSE:
+  • Contraste optique: {contrast_rough*100:.1f}%
+  • Niveau moyen image: {np.mean(img_rough):.1f} (sur 255)
+  • Min/Max pixels: {np.min(img_rough):.1f} / {np.max(img_rough):.1f}
+  • Fréquence spectrale moyenne: {spectral_rough['freq_mean']:.3f} cyc/μm
+  • Largeur spectrale: {spectral_rough['freq_width']:.3f} cyc/μm
+
+COMPARAISON SPECTRALE:
+  • Ratio fréquence moyenne (rugueux/lisse): {spectral_rough['freq_mean']/max(spectral_smooth['freq_mean'], 1e-10):.2f}
+  • Ratio largeur spectrale (rugueux/lisse): {spectral_rough['freq_width']/max(spectral_smooth['freq_width'], 1e-10):.2f}
+  • Fréquence de coupure NA: {f_cutoff:.2f} cyc/μm
+""")
+    
+    return sim_smooth, sim_rough
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Simulation Videodrop - Imagerie interférométrique de nanoparticules"
+        description="Simulation Videodrop - Comparaison particule lisse vs rugueuse"
     )
     parser.add_argument("--radius", type=float, default=80.0,
                        help="Rayon de la particule [nm]")
+    parser.add_argument("--roughness", type=float, default=5.0,
+                       help="Amplitude RMS de la rugosité [nm]")
+    parser.add_argument("--lmax", type=int, default=10,
+                       help="Ordre max des harmoniques sphériques")
     parser.add_argument("--n-particle", type=float, default=1.50,
-                       help="Indice de réfraction de la particule")
+                       help="Indice de réfraction")
     parser.add_argument("--wavelength", type=float, default=488.0,
-                       help="Longueur d'onde LED [nm]")
+                       help="Longueur d'onde [nm]")
     parser.add_argument("--na", type=float, default=0.3,
                        help="Ouverture numérique")
-    parser.add_argument("--pixels", type=int, default=64,
+    parser.add_argument("--pixels", type=int, default=256,
                        help="Taille de l'image [pixels]")
-    parser.add_argument("--ref-amplitude", type=float, default=1.0,
-                       help="Amplitude du faisceau de référence")
-    parser.add_argument("--save", type=str, default="videodrop_result.png",
+    parser.add_argument("--save", type=str, default="videodrop_comparison.png",
                        help="Fichier de sortie")
     parser.add_argument("--no-save", action="store_true",
-                       help="Ne pas sauvegarder la figure")
+                       help="Ne pas sauvegarder")
     
     args = parser.parse_args()
     
-    sim = run_videodrop_simulation(
+    run_comparison(
         radius_nm=args.radius,
+        roughness_nm=args.roughness,
+        roughness_lmax=args.lmax,
         refractive_index=args.n_particle,
         wavelength_nm=args.wavelength,
         numerical_aperture=args.na,
         image_pixels=args.pixels,
-        reference_amplitude=args.ref_amplitude,
         save_path=None if args.no_save else args.save
     )
