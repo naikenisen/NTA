@@ -56,6 +56,7 @@ except ImportError:
     MEEP_AVAILABLE = False
     warnings.warn("MEEP not installed. Running in simulation-only mode with mock data.")
 
+import miepython
 
 # =============================================================================
 # PHYSICAL CONSTANTS AND UNIT SYSTEM
@@ -1070,7 +1071,12 @@ class NTAFDTDSimulation:
         if interferometry:
             # Reference beam: uniform plane wave (or slightly structured)
             # E_ref = A_ref · exp(i·φ_ref)
-            E_ref = E_ref_amplitude * np.exp(1j * E_ref_phase) * np.ones((N, N))
+            # La phase de référence inclut le déphasage dû à la position Z de la particule
+            # Pour une particule à z=0 (centre du domaine), on utilise la phase de référence initiale
+            # Le déphasage Gouy et la phase de diffusion sont déjà dans E_scat
+            
+            # E_ref = A_ref · exp(i·φ_ref) · PSF_ref
+            E_ref = E_ref_amplitude * np.exp(1j * E_ref_phase) * psf_amplitude
             
             # =================================================================
             # INTERFEROMETRIC SIGNAL
