@@ -295,54 +295,6 @@ def setup_camera_and_lighting():
         bg_node.inputs['Color'].default_value = (0, 0, 0, 1)
 
 
-def setup_render_settings():
-    """
-    Configure les paramètres de rendu pour un aspect NTA réaliste
-    """
-    scene = bpy.context.scene
-    scene.render.engine = 'BLENDER_EEVEE_NEXT' if bpy.app.version >= (4, 0, 0) else 'BLENDER_EEVEE'
-    scene.render.resolution_x = 1280
-    scene.render.resolution_y = 720
-    scene.render.fps = 30
-    scene.frame_start = 1
-    scene.frame_end = TOTAL_FRAMES
-    
-    # Bloom pour l'effet de diffusion lumineuse (API différente selon version)
-    if bpy.app.version >= (4, 0, 0):
-        # Blender 4.x - Bloom via compositing ou view layer
-        scene.view_settings.view_transform = 'Standard'
-        scene.view_settings.look = 'High Contrast'
-        # Utiliser Glare node en compositing pour bloom
-        scene.use_nodes = True
-        tree = scene.node_tree
-        tree.nodes.clear()
-        
-        # Render Layers
-        render_layers = tree.nodes.new('CompositorNodeRLayers')
-        render_layers.location = (0, 0)
-        
-        # Glare node (bloom effect)
-        glare = tree.nodes.new('CompositorNodeGlare')
-        glare.glare_type = 'FOG_GLOW'
-        glare.threshold = 0.5
-        glare.size = 6
-        glare.location = (200, 0)
-        
-        # Composite output
-        composite = tree.nodes.new('CompositorNodeComposite')
-        composite.location = (400, 0)
-        
-        # Connect nodes
-        tree.links.new(render_layers.outputs['Image'], glare.inputs['Image'])
-        tree.links.new(glare.outputs['Image'], composite.inputs['Image'])
-    else:
-        # Blender 3.x
-        scene.eevee.use_bloom = True
-        scene.eevee.bloom_threshold = 0.5
-        scene.eevee.bloom_intensity = 0.3
-        scene.eevee.bloom_radius = 6.0
-
-
 # ============================================
 # MAIN - Exécution de la simulation
 # ============================================
@@ -356,7 +308,6 @@ clear_scene()
 
 # Configure la scène
 setup_camera_and_lighting()
-setup_render_settings()
 
 particles = []
 
