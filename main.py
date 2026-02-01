@@ -15,14 +15,18 @@ NUM_PARTICLES = 80          # Nombre de particules individuelles (exosomes)
 NUM_GRANULAR_PARTICLES = 20 # Nombre de particules granuleuses
 TOTAL_FRAMES = 500          # Durée de l'animation
 
-# Tailles des exosomes (en unités Blender, représentant ~100-200nm)
-MIN_EXOSOME_SIZE = 0.10     # ~100nm
-MAX_EXOSOME_SIZE = 0.20     # ~200nm
+# Tailles des exosomes (en unités Blender)
+# Note: échelle non réaliste pour visualisation
+# Les exosomes réels font ~100-200 nm, ici agrandis ~50000x
+MIN_EXOSOME_SIZE = 0.10     # Représente ~100nm
+MAX_EXOSOME_SIZE = 0.20     # Représente ~200nm
 
 # Zone de simulation (volume d'observation NTA)
-VOLUME_X = 8.0
-VOLUME_Y = 8.0
-VOLUME_Z = 10.0  # Profondeur de champ
+# Volume réel NTA: ~80x80x100 µm
+# Ici 1 unité Blender = 10 µm
+VOLUME_X = 8.0   # Largeur du champ de vue (~80 µm)
+VOLUME_Y = 8.0   # Hauteur du champ de vue (~80 µm)
+VOLUME_Z = 10.0  # Profondeur de champ (~100 µm)
 
 # Paramètres physiques
 TEMPERATURE = 298           # Kelvin (25°C)
