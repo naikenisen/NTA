@@ -28,14 +28,8 @@ VOLUME_X = 8.0   # Largeur du champ de vue (~80 µm)
 VOLUME_Y = 8.0   # Hauteur du champ de vue (~80 µm)
 VOLUME_Z = 10.0  # Profondeur de champ (~100 µm)
 
-# Paramètres physiques
-TEMPERATURE = 298           # Kelvin (25°C)
-VISCOSITY = 0.001           # Pa.s (eau)
-BOLTZMANN = 1.38e-23        # Constante de Boltzmann
-
-# Profondeur de champ (plan focal à z=0)
-FOCAL_PLANE_Z = 0.0
-DOF_RANGE = 0.8             # Zone nette autour du plan focal
+# Paramètres physiques pour le mouvement brownien
+BASE_AMPLITUDE = 0.03       # Amplitude de base du mouvement
 
 
 def clear_scene():
@@ -49,49 +43,12 @@ def clear_scene():
             bpy.data.materials.remove(mat)
 
 
-def calculate_diffusion_coefficient(radius_nm):
-    """
-    Calcule le coefficient de diffusion selon Stokes-Einstein
-    D = kT / (6πηr)
-    """
-    radius_m = radius_nm * 1e-9
-    D = BOLTZMANN * TEMPERATURE / (6 * math.pi * VISCOSITY * radius_m)
-    # Conversion en unités Blender (facteur d'échelle)
-    return D * 1e10
 
 
-def calculate_rayleigh_intensity(radius):
-    """
-    Intensité de diffusion Rayleigh ∝ r^6
-    Normalisé pour des valeurs d'émission raisonnables
-    """
-    # Normalisation par rapport à la taille max
-    normalized = radius / MAX_EXOSOME_SIZE
-    intensity = (normalized ** 6) * 50  # Facteur d'échelle pour visibilité
-    return max(intensity, 0.5)  # Minimum pour que les petites soient visibles
 
-
-def calculate_dof_opacity(z_position):
+def create_emission_material(name, base_color=(0.4, 0.8, 1.0), intensity=5.0):
     """
-    Calcule l'opacité/visibilité basée sur la profondeur de champ
-    Les particules hors du plan focal sont plus transparentes
-    """
-    distance_from_focal = abs(z_position - FOCAL_PLANE_Z)
-    
-    if distance_from_focal < DOF_RANGE:
-        # Dans la zone nette
-        opacity = 1.0
-    else:
-        # Atténuation progressive hors zone nette
-        opacity = max(0.1, 1.0 - (distance_from_focal - DOF_RANGE) * 0.8)
-    
-    return opacity
-
-
-def create_emission_material(name, radius, base_color=(0.4, 0.8, 1.0)):
-    """
-    Crée un matériau émissif pour simuler la diffusion lumineuse
-    L'intensité dépend de la taille (Rayleigh)
+    Crée un matériau émissif simple pour visualiser les particules
     """
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
@@ -101,7 +58,7 @@ def create_emission_material(name, radius, base_color=(0.4, 0.8, 1.0)):
     # Noeud Emission
     emission = nodes.new('ShaderNodeEmission')
     emission.inputs['Color'].default_value = (*base_color, 1.0)
-    emission.inputs['Strength'].default_value = calculate_rayleigh_intensity(radius)
+    emission.inputs['Strength'].default_value = intensity
     
     # Noeud de sortie
     output = nodes.new('ShaderNodeOutputMaterial')
@@ -112,7 +69,7 @@ def create_emission_material(name, radius, base_color=(0.4, 0.8, 1.0)):
     return mat
 
 
-def create_granular_material(name, radius, base_color=(1.0, 0.6, 0.2)):
+def create_granular_material(name, base_color=(1.0, 0.6, 0.2), intensity=6.0):
     """
     Crée un matériau émissif granuleux pour simuler des particules avec texture
     Utilise un shader de bruit pour créer l'effet de granularité
@@ -144,7 +101,7 @@ def create_granular_material(name, radius, base_color=(1.0, 0.6, 0.2)):
     
     # Noeud Emission
     emission = nodes.new('ShaderNodeEmission')
-    emission.inputs['Strength'].default_value = calculate_rayleigh_intensity(radius) * 1.2
+    emission.inputs['Strength'].default_value = intensity
     emission.location = (0, 0)
     
     # Noeud de sortie
@@ -176,7 +133,7 @@ def create_particle(name, radius, location):
     color = (0.3, 0.7, 1.0)  # Bleu pour exosomes
     
     # Applique le matériau
-    mat = create_emission_material(f"mat_{name}", radius, color)
+    mat = create_emission_material(f"mat_{name}", color)
     obj.data.materials.append(mat)
     
     return obj
@@ -233,41 +190,25 @@ def create_granular_particle(name, radius, location):
     )
     
     # Applique le matériau granuleux
-    mat = create_granular_material(f"mat_granular_{name}", radius, color)
+    mat = create_granular_material(f"mat_granular_{name}", color)
     obj.data.materials.append(mat)
     
     return obj
 
 
-def brownian_step(radius, dt=1.0):
+def brownian_step(radius):
     """
     Génère un pas de mouvement brownien en 3D
     Les petites particules bougent plus vite (∝ 1/r)
     """
-    # Amplitude de base inversement proportionnelle à la taille
-    base_amplitude = 0.03  # Amplitude visible
+    # Amplitude inversement proportionnelle à la taille
     size_factor = (MAX_EXOSOME_SIZE / radius) ** 0.5  # Petites = plus rapides
-    
-    sigma = base_amplitude * size_factor
+    sigma = BASE_AMPLITUDE * size_factor
     
     dx = random.gauss(0, sigma)
     dy = random.gauss(0, sigma)
     dz = random.gauss(0, sigma * 0.3)  # Moins de mouvement en Z
     return dx, dy, dz
-
-
-def update_material_for_dof(obj, z_position):
-    """
-    Met à jour l'intensité du matériau selon la profondeur de champ
-    """
-    if obj.data.materials:
-        mat = obj.data.materials[0]
-        if mat.use_nodes:
-            for node in mat.node_tree.nodes:
-                if node.type == 'EMISSION':
-                    base_intensity = calculate_rayleigh_intensity(obj.dimensions[0] / 2)
-                    dof_factor = calculate_dof_opacity(z_position)
-                    node.inputs['Strength'].default_value = base_intensity * dof_factor
 
 
 def setup_camera_and_lighting():
@@ -388,20 +329,6 @@ for frame in range(1, TOTAL_FRAMES + 1):
         
         obj.location = (new_x, new_y, new_z)
         obj.keyframe_insert(data_path="location")
-        
-        # Mise à jour de l'intensité selon la profondeur de champ
-        if frame == 1 or frame % 10 == 0:
-            update_material_for_dof(obj, new_z)
-            # Keyframe pour l'intensité du matériau
-            if obj.data.materials:
-                mat = obj.data.materials[0]
-                if mat.use_nodes:
-                    for node in mat.node_tree.nodes:
-                        if node.type == 'EMISSION':
-                            node.inputs['Strength'].keyframe_insert(
-                                data_path="default_value",
-                                frame=frame
-                            )
 
 print("Animation terminée!")
 
