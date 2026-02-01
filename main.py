@@ -1,9 +1,370 @@
-import bpy, random
+import bpy
+import random
+import math
+import mathutils
 
-obj = bpy.data.objects["particle"]
+# ============================================
+# SIMULATION NTA - Nanoparticle Tracking Analysis
+# Exosomes / Vésicules Extracellulaires
+# ============================================
 
-for frame in range(1, 500):
+# --- Paramètres de simulation ---
+NUM_PARTICLES = 80          # Nombre de particules individuelles
+NUM_AGGREGATES = 8          # Nombre d'agrégats
+PARTICLES_PER_AGGREGATE = 5 # Particules par agrégat
+TOTAL_FRAMES = 500          # Durée de l'animation
+
+# Tailles des exosomes (en unités Blender, représentant ~30-150nm)
+MIN_EXOSOME_SIZE = 0.03     # ~30nm
+MAX_EXOSOME_SIZE = 0.15     # ~150nm
+AGGREGATE_SIZE_FACTOR = 2.5 # Les agrégats sont plus gros
+
+# Zone de simulation (volume d'observation NTA)
+VOLUME_X = 4.0
+VOLUME_Y = 4.0
+VOLUME_Z = 2.0  # Profondeur de champ
+
+# Paramètres physiques
+TEMPERATURE = 298           # Kelvin (25°C)
+VISCOSITY = 0.001           # Pa.s (eau)
+BOLTZMANN = 1.38e-23        # Constante de Boltzmann
+
+# Profondeur de champ (plan focal à z=0)
+FOCAL_PLANE_Z = 0.0
+DOF_RANGE = 0.8             # Zone nette autour du plan focal
+
+
+def clear_scene():
+    """Nettoie la scène Blender"""
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete(use_global=False)
+    
+    # Nettoie les matériaux orphelins
+    for mat in bpy.data.materials:
+        if mat.users == 0:
+            bpy.data.materials.remove(mat)
+
+
+def calculate_diffusion_coefficient(radius_nm):
+    """
+    Calcule le coefficient de diffusion selon Stokes-Einstein
+    D = kT / (6πηr)
+    """
+    radius_m = radius_nm * 1e-9
+    D = BOLTZMANN * TEMPERATURE / (6 * math.pi * VISCOSITY * radius_m)
+    # Conversion en unités Blender (facteur d'échelle)
+    return D * 1e10
+
+
+def calculate_rayleigh_intensity(radius):
+    """
+    Intensité de diffusion Rayleigh ∝ r^6
+    Normalisé pour des valeurs d'émission raisonnables
+    """
+    # Normalisation par rapport à la taille max
+    normalized = radius / MAX_EXOSOME_SIZE
+    intensity = (normalized ** 6) * 50  # Facteur d'échelle pour visibilité
+    return max(intensity, 0.5)  # Minimum pour que les petites soient visibles
+
+
+def calculate_dof_opacity(z_position):
+    """
+    Calcule l'opacité/visibilité basée sur la profondeur de champ
+    Les particules hors du plan focal sont plus transparentes
+    """
+    distance_from_focal = abs(z_position - FOCAL_PLANE_Z)
+    
+    if distance_from_focal < DOF_RANGE:
+        # Dans la zone nette
+        opacity = 1.0
+    else:
+        # Atténuation progressive hors zone nette
+        opacity = max(0.1, 1.0 - (distance_from_focal - DOF_RANGE) * 0.8)
+    
+    return opacity
+
+
+def create_emission_material(name, radius, base_color=(0.4, 0.8, 1.0)):
+    """
+    Crée un matériau émissif pour simuler la diffusion lumineuse
+    L'intensité dépend de la taille (Rayleigh)
+    """
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    nodes.clear()
+    
+    # Noeud Emission
+    emission = nodes.new('ShaderNodeEmission')
+    emission.inputs['Color'].default_value = (*base_color, 1.0)
+    emission.inputs['Strength'].default_value = calculate_rayleigh_intensity(radius)
+    
+    # Noeud de sortie
+    output = nodes.new('ShaderNodeOutputMaterial')
+    
+    # Connexion
+    mat.node_tree.links.new(emission.outputs['Emission'], output.inputs['Surface'])
+    
+    return mat
+
+
+def create_particle(name, radius, location, is_aggregate=False):
+    """
+    Crée une particule (sphère) avec les propriétés appropriées
+    """
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        radius=radius,
+        segments=16,
+        ring_count=8,
+        location=location
+    )
+    obj = bpy.context.active_object
+    obj.name = name
+    
+    # Couleur différente pour les agrégats
+    if is_aggregate:
+        color = (1.0, 0.6, 0.2)  # Orange pour agrégats
+    else:
+        color = (0.3, 0.7, 1.0)  # Bleu pour exosomes individuels
+    
+    # Applique le matériau
+    mat = create_emission_material(f"mat_{name}", radius, color)
+    obj.data.materials.append(mat)
+    
+    return obj
+
+
+def brownian_step(radius, dt=1.0):
+    """
+    Génère un pas de mouvement brownien en 3D
+    Les petites particules bougent plus vite (∝ 1/r)
+    """
+    # Amplitude de base inversement proportionnelle à la taille
+    base_amplitude = 0.03  # Amplitude visible
+    size_factor = (MAX_EXOSOME_SIZE / radius) ** 0.5  # Petites = plus rapides
+    
+    sigma = base_amplitude * size_factor
+    
+    dx = random.gauss(0, sigma)
+    dy = random.gauss(0, sigma)
+    dz = random.gauss(0, sigma * 0.3)  # Moins de mouvement en Z
+    return dx, dy, dz
+
+
+def update_material_for_dof(obj, z_position):
+    """
+    Met à jour l'intensité du matériau selon la profondeur de champ
+    """
+    if obj.data.materials:
+        mat = obj.data.materials[0]
+        if mat.use_nodes:
+            for node in mat.node_tree.nodes:
+                if node.type == 'EMISSION':
+                    base_intensity = calculate_rayleigh_intensity(obj.dimensions[0] / 2)
+                    dof_factor = calculate_dof_opacity(z_position)
+                    node.inputs['Strength'].default_value = base_intensity * dof_factor
+
+
+def setup_camera_and_lighting():
+    """
+    Configure la caméra et l'éclairage pour la simulation NTA
+    """
+    # Caméra
+    bpy.ops.object.camera_add(location=(0, 0, 8))
+    camera = bpy.context.active_object
+    camera.name = "NTA_Camera"
+    camera.data.lens = 50
+    camera.data.dof.use_dof = True
+    camera.data.dof.focus_distance = 8.0
+    camera.data.dof.aperture_fstop = 2.8
+    bpy.context.scene.camera = camera
+    
+    # Lumière laser (simule l'illumination NTA)
+    bpy.ops.object.light_add(type='AREA', location=(0, 0, 5))
+    light = bpy.context.active_object
+    light.name = "Laser_Light"
+    light.data.energy = 100
+    light.data.color = (0.4, 0.6, 1.0)
+    light.data.size = 10
+    
+    # Fond noir
+    bpy.context.scene.world.use_nodes = True
+    bg_node = bpy.context.scene.world.node_tree.nodes.get('Background')
+    if bg_node:
+        bg_node.inputs['Color'].default_value = (0, 0, 0, 1)
+
+
+def setup_render_settings():
+    """
+    Configure les paramètres de rendu pour un aspect NTA réaliste
+    """
+    scene = bpy.context.scene
+    scene.render.engine = 'BLENDER_EEVEE_NEXT' if bpy.app.version >= (4, 0, 0) else 'BLENDER_EEVEE'
+    scene.render.resolution_x = 1280
+    scene.render.resolution_y = 720
+    scene.render.fps = 30
+    scene.frame_start = 1
+    scene.frame_end = TOTAL_FRAMES
+    
+    # Bloom pour l'effet de diffusion lumineuse (API différente selon version)
+    if bpy.app.version >= (4, 0, 0):
+        # Blender 4.x - Bloom via compositing ou view layer
+        scene.view_settings.view_transform = 'Standard'
+        scene.view_settings.look = 'High Contrast'
+        # Utiliser Glare node en compositing pour bloom
+        scene.use_nodes = True
+        tree = scene.node_tree
+        tree.nodes.clear()
+        
+        # Render Layers
+        render_layers = tree.nodes.new('CompositorNodeRLayers')
+        render_layers.location = (0, 0)
+        
+        # Glare node (bloom effect)
+        glare = tree.nodes.new('CompositorNodeGlare')
+        glare.glare_type = 'FOG_GLOW'
+        glare.threshold = 0.5
+        glare.size = 6
+        glare.location = (200, 0)
+        
+        # Composite output
+        composite = tree.nodes.new('CompositorNodeComposite')
+        composite.location = (400, 0)
+        
+        # Connect nodes
+        tree.links.new(render_layers.outputs['Image'], glare.inputs['Image'])
+        tree.links.new(glare.outputs['Image'], composite.inputs['Image'])
+    else:
+        # Blender 3.x
+        scene.eevee.use_bloom = True
+        scene.eevee.bloom_threshold = 0.5
+        scene.eevee.bloom_intensity = 0.3
+        scene.eevee.bloom_radius = 6.0
+
+
+# ============================================
+# MAIN - Exécution de la simulation
+# ============================================
+
+print("=" * 50)
+print("SIMULATION NTA - Nanoparticle Tracking Analysis")
+print("=" * 50)
+
+# Nettoie la scène
+clear_scene()
+
+# Configure la scène
+setup_camera_and_lighting()
+setup_render_settings()
+
+particles = []
+
+# --- Création des particules individuelles ---
+print(f"Création de {NUM_PARTICLES} exosomes individuels...")
+for i in range(NUM_PARTICLES):
+    # Taille aléatoire selon distribution log-normale (réaliste pour exosomes)
+    radius = random.lognormvariate(
+        math.log((MIN_EXOSOME_SIZE + MAX_EXOSOME_SIZE) / 2),
+        0.4
+    )
+    radius = max(MIN_EXOSOME_SIZE, min(MAX_EXOSOME_SIZE, radius))
+    
+    # Position initiale aléatoire dans le volume
+    x = random.uniform(-VOLUME_X / 2, VOLUME_X / 2)
+    y = random.uniform(-VOLUME_Y / 2, VOLUME_Y / 2)
+    z = random.uniform(-VOLUME_Z / 2, VOLUME_Z / 2)
+    
+    obj = create_particle(f"exosome_{i:03d}", radius, (x, y, z))
+    
+    # Calcul du coefficient de diffusion (inversement proportionnel à la taille)
+    radius_nm = radius * 1000  # Conversion en "nm" pour le calcul
+    diff_coeff = calculate_diffusion_coefficient(radius_nm)
+    
+    particles.append({
+        'object': obj,
+        'radius': radius,
+        'is_aggregate': False
+    })
+
+# --- Création des agrégats ---
+print(f"Création de {NUM_AGGREGATES} agrégats...")
+for i in range(NUM_AGGREGATES):
+    # Position centrale de l'agrégat
+    center_x = random.uniform(-VOLUME_X / 2, VOLUME_X / 2)
+    center_y = random.uniform(-VOLUME_Y / 2, VOLUME_Y / 2)
+    center_z = random.uniform(-VOLUME_Z / 2, VOLUME_Z / 2)
+    
+    # Taille de l'agrégat (plus gros que les exosomes individuels)
+    aggregate_radius = random.uniform(
+        MAX_EXOSOME_SIZE * 1.5,
+        MAX_EXOSOME_SIZE * AGGREGATE_SIZE_FACTOR
+    )
+    
+    obj = create_particle(
+        f"aggregate_{i:03d}",
+        aggregate_radius,
+        (center_x, center_y, center_z),
+        is_aggregate=True
+    )
+    
+    # Les agrégats diffusent plus lentement
+    radius_nm = aggregate_radius * 1000
+    diff_coeff = calculate_diffusion_coefficient(radius_nm) * 0.5
+    
+    particles.append({
+        'object': obj,
+        'radius': aggregate_radius,
+        'is_aggregate': True
+    })
+
+# --- Animation du mouvement brownien ---
+print(f"Animation sur {TOTAL_FRAMES} frames...")
+for frame in range(1, TOTAL_FRAMES + 1):
+    if frame % 100 == 0:
+        print(f"  Frame {frame}/{TOTAL_FRAMES}")
+    
     bpy.context.scene.frame_set(frame)
-    obj.location.x += random.gauss(0, 0.01)
-    obj.location.y += random.gauss(0, 0.01)
-    obj.keyframe_insert(data_path="location")
+    
+    for p in particles:
+        obj = p['object']
+        
+        # Calcul du pas brownien (basé sur la taille)
+        dx, dy, dz = brownian_step(p['radius'])
+        
+        # Mise à jour de la position
+        new_x = obj.location.x + dx
+        new_y = obj.location.y + dy
+        new_z = obj.location.z + dz
+        
+        # Limites du volume (rebond élastique)
+        if abs(new_x) > VOLUME_X / 2:
+            new_x = obj.location.x - dx
+        if abs(new_y) > VOLUME_Y / 2:
+            new_y = obj.location.y - dy
+        if abs(new_z) > VOLUME_Z / 2:
+            new_z = obj.location.z - dz
+        
+        obj.location = (new_x, new_y, new_z)
+        obj.keyframe_insert(data_path="location")
+        
+        # Mise à jour de l'intensité selon la profondeur de champ
+        if frame == 1 or frame % 10 == 0:
+            update_material_for_dof(obj, new_z)
+            # Keyframe pour l'intensité du matériau
+            if obj.data.materials:
+                mat = obj.data.materials[0]
+                if mat.use_nodes:
+                    for node in mat.node_tree.nodes:
+                        if node.type == 'EMISSION':
+                            node.inputs['Strength'].keyframe_insert(
+                                data_path="default_value",
+                                frame=frame
+                            )
+
+print("Animation terminée!")
+
+# Sauvegarde
+output_file = "NTA_exosome_simulation.blend"
+bpy.ops.wm.save_as_mainfile(filepath=output_file)
+print(f"Fichier sauvegardé: {output_file}")
+print("=" * 50)
