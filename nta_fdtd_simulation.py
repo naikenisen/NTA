@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
 """
 ===============================================================================
-NTA FDTD SIMULATION - Nanoparticle Tracking Analysis Optical Imaging
+NTA FDTD SIMULATION - Interferometric Nanoparticle Imaging
 ===============================================================================
 
-This module simulates a single camera frame of a Videodrop-like NTA system
-using FDTD (Finite-Difference Time-Domain) with MEEP.
+This module simulates a single camera frame of an interferometric scattering
+microscopy (iSCAT) system using FDTD (Finite-Difference Time-Domain) with MEEP.
 
 Physical System:
 - Single nanoparticle illuminated by coherent laser
 - Rayleigh/Mie scattering computed via Maxwell equations
+- INTERFEROMETRIC detection: I = |E_ref + E_scat|²
 - Far-field projection with finite numerical aperture
 - 2D camera intensity image generation
+
+Interferometry Modes:
+- iSCAT (interferometric Scattering): Reference from substrate reflection
+- COBRI (Coherent Brightfield): Reference from transmitted beam
+- Homodyne: Reference from same source, phase-locked
+
+Signal decomposition:
+  I = |E_ref|² + |E_scat|² + 2·Re(E_ref* · E_scat)
+      ↑           ↑              ↑
+   background   very small    INTERFERENCE TERM (linear in E_scat!)
+
+Advantage: Sensitivity scales as r³ (not r⁶ as in dark-field)
 
 Author: Computational Nanophotonics Research Agent
 Date: February 2026
@@ -21,9 +34,10 @@ Physical Assumptions (EXPLICIT):
 2. Particle: Dielectric, size in Rayleigh to Rayleigh-Mie transition
 3. Illumination: Monochromatic plane wave (coherent laser)
 4. Time: Steady-state (no Brownian motion)
-5. Detection: Far-field intensity integrated over camera exposure
+5. Detection: Interferometric - coherent sum of reference and scattered fields
 6. Polarization: Linear (user-defined axis)
 7. Boundaries: Perfect Matched Layers (PML) absorbing boundaries
+8. Reference beam: Phase-locked to illumination (homodyne detection)
 
 ===============================================================================
 """
@@ -401,23 +415,36 @@ class IlluminationParameters:
 @dataclass
 class ImagingParameters:
     """
-    Camera/objective imaging parameters.
+    Camera/objective imaging parameters for interferometric detection.
     
     Physical basis:
     - Finite NA objective collects scattered light
     - Only k-vectors within NA cone reach camera
     - Camera integrates intensity over pixel area
+    - INTERFEROMETRIC: Reference beam interferes with scattered field
     
-    For NTA (Videodrop):
-    - Typical NA: 0.2 - 0.4 (low magnification, large field of view)
-    - Imaging at 90° to illumination (dark-field like)
-    - Camera: CMOS/CCD with ~5-10 μm pixels
+    Interferometry modes:
+    - iSCAT: I = |E_ref + E_scat|² = |E_ref|² + |E_scat|² + 2·Re(E_ref*·E_scat)
+    - The cross-term gives linear sensitivity to E_scat (∝ r³ for Rayleigh)
+    - Reference amplitude controls signal-to-background ratio
+    - Reference phase controls contrast (π/2 = max imaginary part)
+    
+    For iSCAT systems:
+    - High NA objectives (0.4-1.4) for strong collection
+    - Reference from glass/water interface reflection (~4% for glass)
+    - Camera: CMOS with high frame rate, ~6.5 μm pixels
     """
     numerical_aperture: float = 0.3       # Objective NA
     magnification: float = 20.0           # Optical magnification
     camera_pixel_size_um: float = 6.5     # Physical pixel size [μm]
     image_pixels: int = 64                # Image size (pixels per side)
     imaging_axis: str = "y"               # Camera viewing axis
+    
+    # Interferometry parameters
+    interferometry_enabled: bool = True   # Enable interferometric detection
+    reference_amplitude: float = 1.0      # Reference field amplitude (E_ref/E_incident)
+    reference_phase: float = 0.0          # Reference phase [radians] (0=real, π/2=imaginary)
+    background_subtraction: bool = True   # Subtract |E_ref|² background
     
     @property
     def object_pixel_size_um(self) -> float:
@@ -452,6 +479,14 @@ class ImagingParameters:
         print(f"Image size: {self.image_pixels} x {self.image_pixels} pixels")
         print(f"Field of view: {self.field_of_view_um:.1f} μm")
         print(f"Imaging axis: {self.imaging_axis}")
+        print("-" * 60)
+        print("INTERFEROMETRY SETTINGS:")
+        print(f"  Interferometry enabled: {self.interferometry_enabled}")
+        if self.interferometry_enabled:
+            print(f"  Reference amplitude: {self.reference_amplitude}")
+            print(f"  Reference phase: {self.reference_phase:.2f} rad ({np.degrees(self.reference_phase):.1f}°)")
+            print(f"  Background subtraction: {self.background_subtraction}")
+            print("  Signal model: I = |E_ref|² + |E_scat|² + 2·Re(E_ref*·E_scat)")
         print("=" * 60)
 
 
@@ -505,7 +540,7 @@ class SimulationParameters:
 
 class NTAFDTDSimulation:
     """
-    Main FDTD simulation class for NTA optical imaging.
+    Main FDTD simulation class for interferometric nanoparticle imaging.
     
     Workflow:
     1. Set up simulation domain with PML boundaries
@@ -513,8 +548,13 @@ class NTAFDTDSimulation:
     3. Add plane wave source for laser illumination
     4. Define near-to-far-field monitors
     5. Run simulation to steady state
-    6. Compute far-field scattering pattern
-    7. Apply NA filter and generate camera image
+    6. Compute far-field scattering pattern (complex field)
+    7. Apply NA filter and generate interferometric camera image
+    
+    Interferometry model:
+    - I = |E_ref + E_scat|² = |E_ref|² + |E_scat|² + 2·Re(E_ref*·E_scat)
+    - Reference beam provides phase-locked coherent reference
+    - Cross-term gives linear sensitivity to scattered field
     """
     
     def __init__(
@@ -536,6 +576,7 @@ class NTAFDTDSimulation:
         self._near2far = None
         self._far_field_data = None
         self._camera_image = None
+        self._interferometry_data = None  # Stores E_ref, E_scat, decomposed intensities
     
     def print_all_parameters(self):
         """Print complete simulation configuration"""
@@ -748,7 +789,12 @@ class NTAFDTDSimulation:
         print("Simulation complete.")
     
     def _generate_mock_far_field(self):
-        """Generate mock far-field data for testing without MEEP"""
+        """
+        Generate mock far-field data for testing without MEEP.
+        
+        For interferometry, we need the COMPLEX electric field, not just intensity.
+        This allows computing the interference term 2·Re(E_ref* · E_scat).
+        """
         n_theta = 90
         n_phi = 180
         
@@ -756,40 +802,61 @@ class NTAFDTDSimulation:
         phi = np.linspace(0, 2*np.pi, n_phi)
         THETA, PHI = np.meshgrid(theta, phi, indexing='ij')
         
-        # Mock scattering pattern (dipole-like for small particle)
-        # Rayleigh scattering: I ∝ sin²(θ) for perpendicular polarization
+        # Mock scattering amplitude (complex field, not intensity)
+        # Rayleigh scattering: E_scat ∝ α · E_inc · angular_pattern
+        # For dipole: E ∝ (1 - sin²θ cos²φ)^0.5 with phase from optical path
         if self.illumination.polarization == "x":
             # For x-polarized light propagating in z:
-            # Scattered E ∝ (1 - sin²θ cos²φ)
-            pattern = 1.0 - np.sin(THETA)**2 * np.cos(PHI)**2
+            angular_pattern = np.sqrt(np.maximum(1.0 - np.sin(THETA)**2 * np.cos(PHI)**2, 0.01))
         else:
-            pattern = np.sin(THETA)**2
+            angular_pattern = np.abs(np.sin(THETA))
         
-        # Add roughness effect: random phase variations
+        # Scattering amplitude scales with polarizability α ∝ (n²-1)/(n²+2) × V
+        # For Rayleigh: E_scat ∝ k² × α ∝ r³ / λ² × (m²-1)/(m²+2)
+        m = self.particle.refractive_index / self.constants.n_water
+        polarizability_factor = (m**2 - 1) / (m**2 + 2)
+        r = self.particle.radius_um
+        k = 2 * np.pi / self.constants.wavelength_um * self.constants.n_water
+        
+        # Rayleigh scattering amplitude (relative units)
+        E_amplitude = (k**2) * (r**3) * np.abs(polarizability_factor) * angular_pattern
+        
+        # Phase: geometrical phase from scattering direction
+        # For a point dipole at origin, phase = k·r (but in far-field, just direction-dependent)
+        # Add Gouy phase and scattering phase shift
+        base_phase = PHI  # Azimuthal variation
+        scattering_phase = np.angle(complex(polarizability_factor))  # Material phase
+        
+        # Add roughness effects: random phase perturbations (speckle)
         if self.particle.roughness_amplitude_nm > 0:
             np.random.seed(self.particle.roughness_seed)
             roughness_factor = self.particle.roughness_amplitude_nm / self.particle.radius_nm
             
-            # Roughness causes additional angular structure (speckle-like)
-            noise = np.random.randn(n_theta, n_phi) * roughness_factor * 0.3
-            # Smooth the noise slightly
+            # Roughness causes amplitude AND phase variations
+            amplitude_noise = np.random.randn(n_theta, n_phi) * roughness_factor * 0.3
+            phase_noise = np.random.randn(n_theta, n_phi) * roughness_factor * np.pi
+            
+            # Smooth the noise (correlation from surface features)
             from scipy.ndimage import gaussian_filter
-            noise = gaussian_filter(noise, sigma=2)
-            pattern = pattern * (1 + noise)
+            amplitude_noise = gaussian_filter(amplitude_noise, sigma=2)
+            phase_noise = gaussian_filter(phase_noise, sigma=2)
+            
+            E_amplitude = E_amplitude * (1 + amplitude_noise)
+            base_phase = base_phase + phase_noise
         
-        # Scale by size parameter (Rayleigh: σ ∝ a^6)
-        x = self.particle.size_parameter
-        if x < 0.5:
-            # Rayleigh limit
-            intensity_scale = x**4
-        else:
-            # Mie: more complex, approximate
-            intensity_scale = x**2
+        # Construct complex field
+        E_theta = E_amplitude * np.exp(1j * (base_phase + scattering_phase))
+        E_phi = E_amplitude * 0.1 * np.exp(1j * (base_phase + scattering_phase + np.pi/4))  # Cross-pol
+        
+        # Total intensity
+        intensity = np.abs(E_theta)**2 + np.abs(E_phi)**2
         
         self._far_field_data = {
             'theta': THETA,
             'phi': PHI,
-            'intensity': pattern * intensity_scale,
+            'E_theta': E_theta,           # Complex scattered field (θ component)
+            'E_phi': E_phi,               # Complex scattered field (φ component)
+            'intensity': intensity,        # |E_scat|²
             'n_theta': n_theta,
             'n_phi': n_phi
         }
@@ -874,19 +941,28 @@ class NTAFDTDSimulation:
     
     def generate_camera_image(self) -> np.ndarray:
         """
-        Generate 2D camera image from far-field scattering.
+        Generate 2D camera image with INTERFEROMETRIC detection.
         
-        Physical model:
-        1. Far-field intensity gives angular distribution of scattered light
-        2. Objective collects light within NA cone
-        3. Lens performs Fourier transform (far-field → image plane)
-        4. Camera integrates intensity over pixel area
+        Physical model for interferometry (iSCAT-like):
+        ================================================
         
-        For a point scatterer, the image is the PSF convolved with
-        the angular distribution of scattered light.
+        The detected intensity is:
+            I = |E_ref + E_scat|²
+              = |E_ref|² + |E_scat|² + 2·Re(E_ref* · E_scat)
+              
+        Where:
+        - |E_ref|² : Reference beam intensity (constant background)
+        - |E_scat|² : Scattered intensity (∝ r⁶ for Rayleigh, very small)
+        - 2·Re(E_ref* · E_scat) : INTERFERENCE TERM (∝ r³, dominant signal!)
         
-        Here we compute the image in the imaging plane (perpendicular to 
-        imaging axis) by integrating far-field intensity within NA.
+        The interference term provides:
+        1. Linear sensitivity to particle polarizability (∝ r³)
+        2. Phase information preservation
+        3. Greatly enhanced signal-to-noise for small particles
+        
+        Reference beam model:
+        - E_ref = A_ref · exp(i·φ_ref) · PSF_ref
+        - Uniform across the PSF for plane wave reference
         """
         if self._far_field_data is None:
             self.compute_far_field()
@@ -894,7 +970,6 @@ class NTAFDTDSimulation:
         ff = self._far_field_data
         theta = ff['theta']
         phi = ff['phi']
-        intensity = ff['intensity']
         
         # Image parameters
         N = self.imaging.image_pixels
@@ -903,46 +978,28 @@ class NTAFDTDSimulation:
         NA = self.imaging.numerical_aperture
         imaging_axis = self.imaging.imaging_axis
         
+        # Interferometry parameters
+        interferometry = self.imaging.interferometry_enabled
+        E_ref_amplitude = self.imaging.reference_amplitude
+        E_ref_phase = self.imaging.reference_phase
+        background_subtraction = self.imaging.background_subtraction
+        
         # Maximum collection angle
         theta_max = self.imaging.max_collection_angle_rad
         
-        print(f"Generating camera image ({N}x{N} pixels, NA={NA})...")
+        if interferometry:
+            print(f"Generating INTERFEROMETRIC camera image ({N}x{N} pixels, NA={NA})...")
+            print(f"  Reference: amplitude={E_ref_amplitude}, phase={np.degrees(E_ref_phase):.1f}°")
+        else:
+            print(f"Generating camera image ({N}x{N} pixels, NA={NA})...")
         
         # Define image plane coordinates
         x_img = np.linspace(-fov/2, fov/2, N)
         y_img = np.linspace(-fov/2, fov/2, N)
         X_IMG, Y_IMG = np.meshgrid(x_img, y_img, indexing='ij')
         
-        # For each image pixel, integrate far-field intensity
-        # over the solid angle that maps to that pixel
-        
-        # Simplified model: The particle is at the center.
-        # The image is essentially the PSF (Airy pattern) weighted by
-        # the scattering efficiency in that direction.
-        
-        # We compute the average scattered intensity going toward
-        # the camera direction, weighted by the angular distribution.
-        
         # Camera direction based on imaging axis
         if imaging_axis == "y":
-            # Camera looking from +y direction
-            # Collect light around θ=π/2, φ=π/2
-            theta_cam = np.pi / 2
-            phi_cam = np.pi / 2
-            img_axis1, img_axis2 = "x", "z"
-        elif imaging_axis == "x":
-            theta_cam = np.pi / 2
-            phi_cam = 0
-            img_axis1, img_axis2 = "y", "z"
-        else:  # z
-            theta_cam = 0
-            phi_cam = 0
-            img_axis1, img_axis2 = "x", "y"
-        
-        # Find far-field intensity within NA cone around camera axis
-        # Angle from camera axis
-        if imaging_axis == "y":
-            # Camera along +y
             cam_dir = np.array([0, 1, 0])
         elif imaging_axis == "x":
             cam_dir = np.array([1, 0, 0])
@@ -961,62 +1018,109 @@ class NTAFDTDSimulation:
         # Mask for NA cone
         in_na_cone = angle_to_cam <= theta_max
         
-        # Total collected power
-        collected_power = np.sum(intensity[in_na_cone])
-        
-        # Generate PSF-like image
-        # For diffraction-limited imaging, PSF is approximately Gaussian
-        # with width σ ≈ 0.42 λ / NA (for Gaussian approximation to Airy)
+        # PSF parameters
         wavelength_um = self.constants.wavelength_um
-        sigma_psf = 0.42 * wavelength_um / NA
+        sigma_psf = 0.42 * wavelength_um / NA  # Gaussian approximation to Airy
         
         # Distance from center
         R_img = np.sqrt(X_IMG**2 + Y_IMG**2)
         
-        # Gaussian PSF
-        psf = np.exp(-R_img**2 / (2 * sigma_psf**2))
+        # =================================================================
+        # SCATTERED FIELD (complex amplitude)
+        # =================================================================
         
-        # Modulate by angular scattering variation within NA cone
-        # This creates asymmetry if scattering is anisotropic
+        # Get complex scattered field components
+        if 'E_theta' in ff and 'E_phi' in ff:
+            E_theta = ff['E_theta']
+            E_phi = ff['E_phi']
+            
+            # Average complex field within NA cone (weighted by solid angle)
+            E_scat_collected = np.mean(E_theta[in_na_cone]) + np.mean(E_phi[in_na_cone])
+        else:
+            # Fallback: use intensity only (no phase info)
+            E_scat_collected = np.sqrt(np.mean(ff['intensity'][in_na_cone]))
         
-        # Map image coordinates to angles within NA cone
-        # tan(θ) ≈ r / f, but for small NA this is complex
-        # Simplified: use the collected intensity pattern
+        # Scattered field spatial distribution (PSF-shaped)
+        # The scattered light from a point source creates a PSF pattern
+        psf_amplitude = np.exp(-R_img**2 / (4 * sigma_psf**2))  # Amplitude, not intensity
         
-        # For now, we create speckle-like variations if rough
+        # Add phase curvature (Gouy phase + defocus)
+        # For focused PSF: phase varies across the spot
+        k = 2 * np.pi / wavelength_um * self.constants.n_water
+        phase_curvature = k * R_img**2 / (4 * fov)  # Approximate quadratic phase
+        
+        # Roughness-induced phase variations
         if self.particle.roughness_amplitude_nm > 0:
-            # Add angular structure from roughness
-            # This manifests as intensity variations across the PSF
             np.random.seed(self.particle.roughness_seed + 100)
             roughness_factor = self.particle.roughness_amplitude_nm / self.particle.radius_nm
             
-            # Create structured noise (not pure speckle, but coherent structure)
-            # based on far-field intensity within NA cone
-            
-            # Sample intensity at angles corresponding to image positions
-            # This is a simplified coherent imaging model
-            
-            # Add phase variations
             phase_var = np.random.randn(N, N) * roughness_factor * np.pi
             from scipy.ndimage import gaussian_filter
             phase_var = gaussian_filter(phase_var, sigma=N/20)
-            
-            # Coherent intensity with phase
-            amplitude = np.sqrt(psf) * np.exp(1j * phase_var)
-            image = np.abs(amplitude)**2
         else:
-            # Smooth particle: clean PSF
-            image = psf
+            phase_var = 0
         
-        # Scale by collected power
-        image = image * collected_power / np.max(image) if np.max(image) > 0 else image
+        # Complex scattered field at image plane
+        E_scat = E_scat_collected * psf_amplitude * np.exp(1j * (phase_curvature + phase_var))
         
-        # Add shot noise (Poisson statistics) - optional
-        # For now, keep ideal image
+        # =================================================================
+        # REFERENCE FIELD (for interferometry)
+        # =================================================================
+        
+        if interferometry:
+            # Reference beam: uniform plane wave (or slightly structured)
+            # E_ref = A_ref · exp(i·φ_ref)
+            E_ref = E_ref_amplitude * np.exp(1j * E_ref_phase) * np.ones((N, N))
+            
+            # =================================================================
+            # INTERFEROMETRIC SIGNAL
+            # =================================================================
+            # I = |E_ref + E_scat|² = |E_ref|² + |E_scat|² + 2·Re(E_ref* · E_scat)
+            
+            E_total = E_ref + E_scat
+            I_total = np.abs(E_total)**2
+            
+            # Decompose for analysis
+            I_ref = np.abs(E_ref)**2                           # Background
+            I_scat = np.abs(E_scat)**2                         # Pure scattering (weak)
+            I_interference = 2 * np.real(np.conj(E_ref) * E_scat)  # Cross-term (strong!)
+            
+            # Store decomposition for analysis
+            self._interferometry_data = {
+                'I_ref': I_ref,
+                'I_scat': I_scat,
+                'I_interference': I_interference,
+                'I_total': I_total,
+                'E_ref': E_ref,
+                'E_scat': E_scat
+            }
+            
+            if background_subtraction:
+                # Return interference signal (background-subtracted)
+                # This is what's typically analyzed in iSCAT
+                image = I_total - I_ref.mean()  # Subtract mean background
+                print(f"  Background subtracted: I_ref_mean = {I_ref.mean():.4f}")
+            else:
+                image = I_total
+            
+            # Print signal analysis
+            print(f"  |E_scat|² max: {np.max(I_scat):.2e}")
+            print(f"  Interference term max: {np.max(np.abs(I_interference)):.2e}")
+            print(f"  Signal enhancement: {np.max(np.abs(I_interference)) / (np.max(I_scat) + 1e-20):.1f}x")
+            
+        else:
+            # =================================================================
+            # NON-INTERFEROMETRIC (dark-field/scattering only)
+            # =================================================================
+            I_scat = np.abs(E_scat)**2
+            image = I_scat
+            
+            self._interferometry_data = None
         
         self._camera_image = image
         
-        print(f"Camera image generated. Max intensity: {np.max(image):.4f}")
+        print(f"Camera image generated. Max intensity: {np.max(image):.4e}")
+        print(f"                        Min intensity: {np.min(image):.4e}")
         return self._camera_image
     
     def plot_results(self, save_path: Optional[str] = None):
@@ -1099,26 +1203,59 @@ class NTAFDTDSimulation:
             ax4.set_title('Far-Field Intensity Map')
             plt.colorbar(im, ax=ax4, label='Intensity [a.u.]')
         
-        # 5. Camera image
+        # 5. Camera image (with interferometry details if enabled)
         ax5 = fig.add_subplot(2, 3, 5)
         if self._camera_image is not None:
             fov = self.imaging.field_of_view_um
             extent = [-fov/2, fov/2, -fov/2, fov/2]
+            
+            # Choose colormap based on interferometry (can be negative with bg subtraction)
+            if self.imaging.interferometry_enabled and self.imaging.background_subtraction:
+                cmap = 'RdBu_r'
+                vmax = np.max(np.abs(self._camera_image))
+                vmin = -vmax
+            else:
+                cmap = 'gray'
+                vmin, vmax = None, None
+            
             im = ax5.imshow(
                 self._camera_image.T,
                 origin='lower',
                 extent=extent,
-                cmap='gray',
-                aspect='equal'
+                cmap=cmap,
+                aspect='equal',
+                vmin=vmin, vmax=vmax
             )
             ax5.set_xlabel('X [μm]')
             ax5.set_ylabel('Z [μm]')
-            ax5.set_title(f'Camera Image\n(NA={self.imaging.numerical_aperture})')
+            
+            if self.imaging.interferometry_enabled:
+                title = f'Interferometric Image\n(NA={self.imaging.numerical_aperture})'
+                if self.imaging.background_subtraction:
+                    title += ' [bg subtracted]'
+            else:
+                title = f'Scattering Image\n(NA={self.imaging.numerical_aperture})'
+            ax5.set_title(title)
             plt.colorbar(im, ax=ax5, label='Intensity [a.u.]')
         
-        # 6. Parameter summary
+        # 6. Parameter summary (with interferometry info)
         ax6 = fig.add_subplot(2, 3, 6)
         ax6.axis('off')
+        
+        # Build interferometry string
+        if self.imaging.interferometry_enabled:
+            interf_text = f"""
+Interferometry:
+  • Mode: ENABLED (iSCAT-like)
+  • Reference amplitude: {self.imaging.reference_amplitude}
+  • Reference phase: {np.degrees(self.imaging.reference_phase):.1f}°
+  • Background subtraction: {self.imaging.background_subtraction}
+  • Signal: I = |E_ref|² + |E_scat|² + 2·Re(E_ref*·E_scat)"""
+        else:
+            interf_text = """
+Interferometry:
+  • Mode: DISABLED (scattering only)
+  • Signal: I = |E_scat|²"""
         
         params_text = f"""
 PHYSICAL PARAMETERS
@@ -1141,6 +1278,7 @@ Imaging:
   • Magnification: {self.imaging.magnification}x
   • Pixel size (object): {self.imaging.object_pixel_size_um:.3f} μm
   • Field of view: {self.imaging.field_of_view_um:.1f} μm
+{interf_text}
 
 Medium:
   • Refractive index: {self.constants.n_water}
@@ -1420,6 +1558,679 @@ For NTA applications:
     return sim_smooth, sim_rough
 
 
+def spectral_analysis_smooth_vs_rough(
+    radius_nm: float = 80.0,
+    roughness_nm: float = 5.0,
+    roughness_lmax: int = 10,
+    reference_amplitude: float = 1.0,
+    save_path: Optional[str] = None
+) -> dict:
+    """
+    Perform spectral (FFT) analysis comparing smooth vs rough particles in interferometry.
+    
+    Physical basis:
+    ===============
+    The camera image contains spatial frequencies determined by:
+    
+    1. PSF (Point Spread Function):
+       - Cutoff frequency: f_c = NA / λ
+       - For NA=0.3, λ=488nm: f_c ≈ 0.6 cycles/μm
+    
+    2. Scattering angular distribution:
+       - Smooth particle: clean Mie/Rayleigh pattern → low frequencies
+       - Rough particle: speckle from random phases → high frequencies
+    
+    3. Interference pattern:
+       - Phase variations from roughness create fine structure
+       - FFT reveals these as enhanced high-frequency components
+    
+    The spectral signature of roughness:
+    - Increased power at high spatial frequencies
+    - Broader spectral width
+    - Reduced peak-to-background ratio in spectrum
+    
+    Args:
+        radius_nm: Particle radius
+        roughness_nm: RMS roughness for rough particle
+        roughness_lmax: Maximum spherical harmonic order
+        reference_amplitude: Reference beam amplitude
+        save_path: Optional path to save figure
+    
+    Returns:
+        Dictionary containing spectral analysis results
+    """
+    print("=" * 70)
+    print("SPECTRAL ANALYSIS: SMOOTH vs ROUGH PARTICLE (INTERFEROMETRY)")
+    print("=" * 70)
+    
+    # Common parameters
+    illumination = IlluminationParameters(
+        wavelength_nm=488.0,
+        polarization="x",
+        propagation_direction="z"
+    )
+    
+    imaging = ImagingParameters(
+        numerical_aperture=0.3,
+        magnification=20.0,
+        image_pixels=128,  # Higher resolution for better FFT
+        interferometry_enabled=True,
+        reference_amplitude=reference_amplitude,
+        reference_phase=0.0,
+        background_subtraction=True
+    )
+    
+    simulation = SimulationParameters(
+        resolution=50,
+        simulation_time_factor=100
+    )
+    
+    # --- SMOOTH PARTICLE ---
+    print("\n--- SMOOTH PARTICLE (interferometry) ---")
+    particle_smooth = ParticleParameters(
+        radius_nm=radius_nm,
+        refractive_index=1.50,
+        roughness_amplitude_nm=0.0,
+        material_name="polystyrene (smooth)"
+    )
+    
+    sim_smooth = NTAFDTDSimulation(
+        particle=particle_smooth,
+        illumination=illumination,
+        imaging=imaging,
+        simulation=simulation
+    )
+    
+    sim_smooth.run()
+    sim_smooth.compute_far_field()
+    sim_smooth.generate_camera_image()
+    
+    # --- ROUGH PARTICLE ---
+    print("\n--- ROUGH PARTICLE (interferometry) ---")
+    particle_rough = ParticleParameters(
+        radius_nm=radius_nm,
+        refractive_index=1.50,
+        roughness_amplitude_nm=roughness_nm,
+        roughness_lmax=roughness_lmax,
+        material_name="polystyrene (rough)"
+    )
+    
+    sim_rough = NTAFDTDSimulation(
+        particle=particle_rough,
+        illumination=illumination,
+        imaging=imaging,
+        simulation=simulation
+    )
+    
+    sim_rough.run()
+    sim_rough.compute_far_field()
+    sim_rough.generate_camera_image()
+    
+    # =================================================================
+    # SPECTRAL ANALYSIS (2D FFT)
+    # =================================================================
+    print("\n" + "-" * 70)
+    print("COMPUTING 2D FFT SPECTRAL ANALYSIS")
+    print("-" * 70)
+    
+    # Get images
+    img_smooth = sim_smooth._camera_image
+    img_rough = sim_rough._camera_image
+    
+    N = imaging.image_pixels
+    fov = imaging.field_of_view_um
+    pixel_size = fov / N  # μm per pixel
+    
+    # Spatial frequency axis
+    freq = np.fft.fftfreq(N, d=pixel_size)  # cycles per μm
+    freq_shift = np.fft.fftshift(freq)
+    FX, FY = np.meshgrid(freq_shift, freq_shift, indexing='ij')
+    F_radial = np.sqrt(FX**2 + FY**2)
+    
+    # 2D FFT (centered)
+    fft_smooth = np.fft.fftshift(np.fft.fft2(img_smooth))
+    fft_rough = np.fft.fftshift(np.fft.fft2(img_rough))
+    
+    # Power spectral density
+    psd_smooth = np.abs(fft_smooth)**2
+    psd_rough = np.abs(fft_rough)**2
+    
+    # Normalize by DC component for comparison
+    psd_smooth_norm = psd_smooth / (np.max(psd_smooth) + 1e-20)
+    psd_rough_norm = psd_rough / (np.max(psd_rough) + 1e-20)
+    
+    # =================================================================
+    # RADIAL AVERAGING (azimuthally averaged power spectrum)
+    # =================================================================
+    
+    def radial_profile(data, center=None):
+        """Compute azimuthally averaged radial profile of 2D data."""
+        if center is None:
+            center = np.array(data.shape) // 2
+        
+        y, x = np.indices(data.shape)
+        r = np.sqrt((x - center[1])**2 + (y - center[0])**2)
+        r = r.astype(int)
+        
+        # Radial bins
+        r_max = int(np.max(r))
+        tbin = np.bincount(r.ravel(), weights=data.ravel())
+        nr = np.bincount(r.ravel())
+        radial_mean = tbin / (nr + 1e-10)
+        
+        return radial_mean[:r_max]
+    
+    radial_smooth = radial_profile(psd_smooth_norm)
+    radial_rough = radial_profile(psd_rough_norm)
+    
+    # Frequency axis for radial profile (in cycles/μm)
+    freq_max = np.max(np.abs(freq_shift))
+    n_radial = len(radial_smooth)
+    freq_radial = np.linspace(0, freq_max, n_radial)
+    
+    # =================================================================
+    # SPECTRAL METRICS
+    # =================================================================
+    
+    # 1. Spectral centroid (mean frequency weighted by power)
+    def spectral_centroid(radial_psd, freq_axis):
+        return np.sum(freq_axis * radial_psd) / (np.sum(radial_psd) + 1e-20)
+    
+    centroid_smooth = spectral_centroid(radial_smooth, freq_radial)
+    centroid_rough = spectral_centroid(radial_rough, freq_radial)
+    
+    # 2. Spectral width (RMS bandwidth)
+    def spectral_width(radial_psd, freq_axis, centroid):
+        return np.sqrt(np.sum((freq_axis - centroid)**2 * radial_psd) / (np.sum(radial_psd) + 1e-20))
+    
+    width_smooth = spectral_width(radial_smooth, freq_radial, centroid_smooth)
+    width_rough = spectral_width(radial_rough, freq_radial, centroid_rough)
+    
+    # 3. High-frequency power ratio (power above f_c / total power)
+    f_cutoff = imaging.numerical_aperture / (illumination.wavelength_nm / 1000)  # cycles/μm
+    idx_high = freq_radial > f_cutoff * 0.5  # Above half the cutoff
+    
+    hf_ratio_smooth = np.sum(radial_smooth[idx_high]) / (np.sum(radial_smooth) + 1e-20)
+    hf_ratio_rough = np.sum(radial_rough[idx_high]) / (np.sum(radial_rough) + 1e-20)
+    
+    # 4. Spectral entropy (measure of spectral spread)
+    def spectral_entropy(psd_norm):
+        psd_prob = psd_norm / (np.sum(psd_norm) + 1e-20)
+        psd_prob = psd_prob[psd_prob > 0]
+        return -np.sum(psd_prob * np.log2(psd_prob + 1e-20))
+    
+    entropy_smooth = spectral_entropy(radial_smooth)
+    entropy_rough = spectral_entropy(radial_rough)
+    
+    # Store results
+    results = {
+        'img_smooth': img_smooth,
+        'img_rough': img_rough,
+        'fft_smooth': fft_smooth,
+        'fft_rough': fft_rough,
+        'psd_smooth': psd_smooth_norm,
+        'psd_rough': psd_rough_norm,
+        'radial_smooth': radial_smooth,
+        'radial_rough': radial_rough,
+        'freq_radial': freq_radial,
+        'freq_2d': (FX, FY),
+        'metrics': {
+            'centroid_smooth': centroid_smooth,
+            'centroid_rough': centroid_rough,
+            'width_smooth': width_smooth,
+            'width_rough': width_rough,
+            'hf_ratio_smooth': hf_ratio_smooth,
+            'hf_ratio_rough': hf_ratio_rough,
+            'entropy_smooth': entropy_smooth,
+            'entropy_rough': entropy_rough,
+            'f_cutoff': f_cutoff
+        }
+    }
+    
+    # =================================================================
+    # VISUALIZATION
+    # =================================================================
+    
+    fig = plt.figure(figsize=(18, 14))
+    
+    fov = imaging.field_of_view_um
+    extent_space = [-fov/2, fov/2, -fov/2, fov/2]
+    extent_freq = [freq_shift.min(), freq_shift.max(), freq_shift.min(), freq_shift.max()]
+    
+    # Row 1: Spatial domain images
+    ax1 = fig.add_subplot(3, 4, 1)
+    vmax = np.max(np.abs(img_smooth))
+    im1 = ax1.imshow(img_smooth.T, origin='lower', extent=extent_space,
+                     cmap='RdBu_r', aspect='equal', vmin=-vmax, vmax=vmax)
+    ax1.set_xlabel('X [μm]')
+    ax1.set_ylabel('Z [μm]')
+    ax1.set_title('Smooth Particle\n(Interferometric Image)')
+    plt.colorbar(im1, ax=ax1, shrink=0.8)
+    
+    ax2 = fig.add_subplot(3, 4, 2)
+    vmax = np.max(np.abs(img_rough))
+    im2 = ax2.imshow(img_rough.T, origin='lower', extent=extent_space,
+                     cmap='RdBu_r', aspect='equal', vmin=-vmax, vmax=vmax)
+    ax2.set_xlabel('X [μm]')
+    ax2.set_ylabel('Z [μm]')
+    ax2.set_title(f'Rough Particle (σ={roughness_nm}nm)\n(Interferometric Image)')
+    plt.colorbar(im2, ax=ax2, shrink=0.8)
+    
+    # Difference image
+    ax3 = fig.add_subplot(3, 4, 3)
+    diff = img_rough - img_smooth
+    vmax_diff = np.max(np.abs(diff))
+    im3 = ax3.imshow(diff.T, origin='lower', extent=extent_space,
+                     cmap='RdBu_r', aspect='equal', vmin=-vmax_diff, vmax=vmax_diff)
+    ax3.set_xlabel('X [μm]')
+    ax3.set_ylabel('Z [μm]')
+    ax3.set_title('Difference\n(Rough - Smooth)')
+    plt.colorbar(im3, ax=ax3, shrink=0.8)
+    
+    # Line profiles
+    ax4 = fig.add_subplot(3, 4, 4)
+    x_coords = np.linspace(-fov/2, fov/2, N)
+    ax4.plot(x_coords, img_smooth[N//2, :], 'b-', linewidth=2, label='Smooth')
+    ax4.plot(x_coords, img_rough[N//2, :], 'r-', linewidth=1.5, alpha=0.8, label='Rough')
+    ax4.set_xlabel('Position [μm]')
+    ax4.set_ylabel('Intensity')
+    ax4.set_title('Central Line Profile')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    # Row 2: Frequency domain (2D PSD)
+    ax5 = fig.add_subplot(3, 4, 5)
+    im5 = ax5.imshow(np.log10(psd_smooth_norm.T + 1e-10), origin='lower', extent=extent_freq,
+                     cmap='viridis', aspect='equal', vmin=-6, vmax=0)
+    ax5.set_xlabel('$f_x$ [cycles/μm]')
+    ax5.set_ylabel('$f_y$ [cycles/μm]')
+    ax5.set_title('Power Spectrum (Smooth)\nlog₁₀(PSD)')
+    plt.colorbar(im5, ax=ax5, shrink=0.8)
+    # Add NA cutoff circle
+    theta_circle = np.linspace(0, 2*np.pi, 100)
+    ax5.plot(f_cutoff * np.cos(theta_circle), f_cutoff * np.sin(theta_circle), 
+             'r--', linewidth=1.5, label=f'NA cutoff ({f_cutoff:.2f})')
+    
+    ax6 = fig.add_subplot(3, 4, 6)
+    im6 = ax6.imshow(np.log10(psd_rough_norm.T + 1e-10), origin='lower', extent=extent_freq,
+                     cmap='viridis', aspect='equal', vmin=-6, vmax=0)
+    ax6.set_xlabel('$f_x$ [cycles/μm]')
+    ax6.set_ylabel('$f_y$ [cycles/μm]')
+    ax6.set_title('Power Spectrum (Rough)\nlog₁₀(PSD)')
+    plt.colorbar(im6, ax=ax6, shrink=0.8)
+    ax6.plot(f_cutoff * np.cos(theta_circle), f_cutoff * np.sin(theta_circle), 
+             'r--', linewidth=1.5)
+    
+    # PSD difference
+    ax7 = fig.add_subplot(3, 4, 7)
+    psd_diff = np.log10(psd_rough_norm + 1e-10) - np.log10(psd_smooth_norm + 1e-10)
+    vmax_psd = np.max(np.abs(psd_diff))
+    im7 = ax7.imshow(psd_diff.T, origin='lower', extent=extent_freq,
+                     cmap='RdBu_r', aspect='equal', vmin=-vmax_psd, vmax=vmax_psd)
+    ax7.set_xlabel('$f_x$ [cycles/μm]')
+    ax7.set_ylabel('$f_y$ [cycles/μm]')
+    ax7.set_title('PSD Difference\nlog₁₀(Rough/Smooth)')
+    plt.colorbar(im7, ax=ax7, shrink=0.8)
+    ax7.plot(f_cutoff * np.cos(theta_circle), f_cutoff * np.sin(theta_circle), 
+             'k--', linewidth=1.5)
+    
+    # Radial PSD comparison
+    ax8 = fig.add_subplot(3, 4, 8)
+    ax8.semilogy(freq_radial, radial_smooth, 'b-', linewidth=2, label='Smooth')
+    ax8.semilogy(freq_radial, radial_rough, 'r-', linewidth=2, label='Rough')
+    ax8.axvline(x=f_cutoff, color='k', linestyle='--', alpha=0.5, label=f'NA cutoff')
+    ax8.axvline(x=centroid_smooth, color='b', linestyle=':', alpha=0.7)
+    ax8.axvline(x=centroid_rough, color='r', linestyle=':', alpha=0.7)
+    ax8.set_xlabel('Spatial Frequency [cycles/μm]')
+    ax8.set_ylabel('Radial PSD (normalized)')
+    ax8.set_title('Azimuthally Averaged\nPower Spectrum')
+    ax8.legend()
+    ax8.grid(True, alpha=0.3)
+    ax8.set_xlim([0, freq_max])
+    
+    # Row 3: Detailed analysis
+    ax9 = fig.add_subplot(3, 4, 9)
+    ratio = radial_rough / (radial_smooth + 1e-20)
+    ax9.plot(freq_radial, ratio, 'g-', linewidth=2)
+    ax9.axhline(y=1, color='k', linestyle='--', alpha=0.5)
+    ax9.axvline(x=f_cutoff, color='k', linestyle='--', alpha=0.5, label='NA cutoff')
+    ax9.set_xlabel('Spatial Frequency [cycles/μm]')
+    ax9.set_ylabel('Power Ratio (Rough/Smooth)')
+    ax9.set_title('Spectral Ratio\n(Roughness Effect)')
+    ax9.grid(True, alpha=0.3)
+    ax9.set_xlim([0, freq_max])
+    ax9.set_ylim([0, np.min([np.max(ratio), 10])])
+    
+    # Cumulative power
+    ax10 = fig.add_subplot(3, 4, 10)
+    cum_smooth = np.cumsum(radial_smooth) / np.sum(radial_smooth)
+    cum_rough = np.cumsum(radial_rough) / np.sum(radial_rough)
+    ax10.plot(freq_radial, cum_smooth, 'b-', linewidth=2, label='Smooth')
+    ax10.plot(freq_radial, cum_rough, 'r-', linewidth=2, label='Rough')
+    ax10.axvline(x=f_cutoff, color='k', linestyle='--', alpha=0.5)
+    ax10.axhline(y=0.5, color='gray', linestyle=':', alpha=0.5)
+    ax10.set_xlabel('Spatial Frequency [cycles/μm]')
+    ax10.set_ylabel('Cumulative Power')
+    ax10.set_title('Cumulative Power Spectrum')
+    ax10.legend()
+    ax10.grid(True, alpha=0.3)
+    ax10.set_xlim([0, freq_max])
+    
+    # Phase spectrum comparison
+    ax11 = fig.add_subplot(3, 4, 11)
+    phase_smooth = np.angle(fft_smooth)
+    phase_rough = np.angle(fft_rough)
+    phase_diff = np.angle(fft_rough * np.conj(fft_smooth))
+    im11 = ax11.imshow(phase_diff.T, origin='lower', extent=extent_freq,
+                      cmap='twilight', aspect='equal', vmin=-np.pi, vmax=np.pi)
+    ax11.set_xlabel('$f_x$ [cycles/μm]')
+    ax11.set_ylabel('$f_y$ [cycles/μm]')
+    ax11.set_title('Phase Difference\n(Rough - Smooth)')
+    plt.colorbar(im11, ax=ax11, shrink=0.8, label='Phase [rad]')
+    
+    # Metrics summary
+    ax12 = fig.add_subplot(3, 4, 12)
+    ax12.axis('off')
+    
+    metrics_text = f"""
+SPECTRAL ANALYSIS METRICS
+{'='*50}
+
+Spectral Centroid (mean frequency):
+  • Smooth: {centroid_smooth:.3f} cycles/μm
+  • Rough:  {centroid_rough:.3f} cycles/μm
+  • Shift:  {(centroid_rough - centroid_smooth):.3f} cycles/μm
+           ({(centroid_rough/centroid_smooth - 1)*100:+.1f}%)
+
+Spectral Width (RMS bandwidth):
+  • Smooth: {width_smooth:.3f} cycles/μm
+  • Rough:  {width_rough:.3f} cycles/μm
+  • Change: {(width_rough/width_smooth - 1)*100:+.1f}%
+
+High-Frequency Power Ratio (f > {f_cutoff*0.5:.2f} cycles/μm):
+  • Smooth: {hf_ratio_smooth*100:.2f}%
+  • Rough:  {hf_ratio_rough*100:.2f}%
+  • Increase: {(hf_ratio_rough/hf_ratio_smooth - 1)*100:+.1f}%
+
+Spectral Entropy (spread measure):
+  • Smooth: {entropy_smooth:.2f} bits
+  • Rough:  {entropy_rough:.2f} bits
+
+PHYSICAL INTERPRETATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Surface roughness introduces random phase variations
+in the scattered field, leading to:
+• Higher spectral centroid (more high-freq content)
+• Broader spectral width (less concentrated power)
+• Increased high-frequency power ratio
+• Higher spectral entropy (more disordered spectrum)
+
+These spectral signatures can be used to:
+✓ Detect surface roughness from single images
+✓ Estimate roughness parameters
+✓ Distinguish smooth vs textured particles
+"""
+    ax12.text(0.02, 0.98, metrics_text, transform=ax12.transAxes,
+              fontfamily='monospace', fontsize=8.5,
+              verticalalignment='top')
+    
+    plt.suptitle(f'Spectral Analysis: Smooth vs Rough Particle (Interferometry)\n'
+                 f'R={radius_nm}nm, σ_rough={roughness_nm}nm, l_max={roughness_lmax}, '
+                 f'λ=488nm, NA={imaging.numerical_aperture}',
+                 fontsize=12, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\nFigure saved to {save_path}")
+    
+    plt.show()
+    
+    # Print summary
+    print("\n" + "=" * 70)
+    print("SPECTRAL ANALYSIS SUMMARY")
+    print("=" * 70)
+    print(f"""
+Particle: R = {radius_nm} nm, Roughness = {roughness_nm} nm
+
+Key Findings:
+  • Spectral centroid shift: {(centroid_rough - centroid_smooth):.3f} cycles/μm ({(centroid_rough/centroid_smooth - 1)*100:+.1f}%)
+  • Spectral width increase: {(width_rough/width_smooth - 1)*100:+.1f}%
+  • High-frequency power increase: {(hf_ratio_rough/hf_ratio_smooth - 1)*100:+.1f}%
+
+Conclusion: Roughness signature is {'DETECTABLE' if abs(hf_ratio_rough/hf_ratio_smooth - 1) > 0.1 else 'WEAK'} in the spectral domain.
+""")
+    
+    return results
+
+
+def compare_interferometry_vs_scattering(
+    radius_nm: float = 80.0,
+    roughness_nm: float = 0.0,
+    reference_amplitude: float = 1.0,
+    reference_phase: float = 0.0,
+    save_path: Optional[str] = None
+) -> Tuple[NTAFDTDSimulation, NTAFDTDSimulation]:
+    """
+    Compare interferometric detection vs pure scattering detection.
+    
+    This demonstrates the key advantage of interferometry (iSCAT):
+    - Scattering: I ∝ |E_scat|² ∝ r⁶ (Rayleigh)
+    - Interferometry: I ∝ 2·Re(E_ref*·E_scat) ∝ r³ (linear in polarizability!)
+    
+    Args:
+        radius_nm: Particle radius
+        roughness_nm: RMS surface roughness
+        reference_amplitude: Reference beam amplitude (controls contrast)
+        reference_phase: Reference phase (0=real, π/2=imaginary component)
+        save_path: Optional path to save comparison figure
+    
+    Returns:
+        Tuple of (scattering_simulation, interferometric_simulation)
+    """
+    print("=" * 70)
+    print("INTERFEROMETRY vs SCATTERING COMPARISON")
+    print("=" * 70)
+    
+    # Common parameters
+    particle = ParticleParameters(
+        radius_nm=radius_nm,
+        refractive_index=1.50,
+        roughness_amplitude_nm=roughness_nm,
+        material_name="polystyrene"
+    )
+    
+    illumination = IlluminationParameters(
+        wavelength_nm=488.0,
+        polarization="x",
+        propagation_direction="z"
+    )
+    
+    simulation = SimulationParameters(
+        resolution=50,
+        simulation_time_factor=100
+    )
+    
+    # --- SCATTERING ONLY (dark-field like) ---
+    print("\n--- SCATTERING ONLY (dark-field) ---")
+    imaging_scattering = ImagingParameters(
+        numerical_aperture=0.3,
+        magnification=20.0,
+        image_pixels=64,
+        interferometry_enabled=False  # No reference beam
+    )
+    
+    sim_scattering = NTAFDTDSimulation(
+        particle=particle,
+        illumination=illumination,
+        imaging=imaging_scattering,
+        simulation=simulation
+    )
+    
+    sim_scattering.run()
+    sim_scattering.compute_far_field()
+    sim_scattering.generate_camera_image()
+    
+    # --- INTERFEROMETRIC (iSCAT-like) ---
+    print("\n--- INTERFEROMETRIC DETECTION (iSCAT) ---")
+    imaging_interf = ImagingParameters(
+        numerical_aperture=0.3,
+        magnification=20.0,
+        image_pixels=64,
+        interferometry_enabled=True,
+        reference_amplitude=reference_amplitude,
+        reference_phase=reference_phase,
+        background_subtraction=True
+    )
+    
+    sim_interf = NTAFDTDSimulation(
+        particle=particle,
+        illumination=illumination,
+        imaging=imaging_interf,
+        simulation=simulation
+    )
+    
+    sim_interf.run()
+    sim_interf.compute_far_field()
+    sim_interf.generate_camera_image()
+    
+    # --- Create comparison figure ---
+    fig = plt.figure(figsize=(16, 12))
+    
+    fov = imaging_scattering.field_of_view_um
+    extent = [-fov/2, fov/2, -fov/2, fov/2]
+    N = imaging_scattering.image_pixels
+    x_coords = np.linspace(-fov/2, fov/2, N)
+    
+    # Row 1: Scattering only
+    ax1 = fig.add_subplot(2, 4, 1)
+    im1 = ax1.imshow(sim_scattering._camera_image.T, origin='lower', extent=extent,
+                     cmap='hot', aspect='equal')
+    ax1.set_xlabel('X [μm]')
+    ax1.set_ylabel('Z [μm]')
+    ax1.set_title('Scattering Only\n(dark-field)')
+    plt.colorbar(im1, ax=ax1, shrink=0.8, label='I = |E_scat|²')
+    
+    ax2 = fig.add_subplot(2, 4, 2)
+    ax2.plot(x_coords, sim_scattering._camera_image[N//2, :], 'r-', linewidth=2)
+    ax2.set_xlabel('Position [μm]')
+    ax2.set_ylabel('Intensity [a.u.]')
+    ax2.set_title('Scattering: Line Profile')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')
+    ax2.set_ylim([1e-10, 1])
+    
+    # Row 1: Interferometry
+    ax3 = fig.add_subplot(2, 4, 3)
+    interf_img = sim_interf._camera_image
+    vmax = np.max(np.abs(interf_img))
+    im3 = ax3.imshow(interf_img.T, origin='lower', extent=extent,
+                     cmap='RdBu_r', aspect='equal', vmin=-vmax, vmax=vmax)
+    ax3.set_xlabel('X [μm]')
+    ax3.set_ylabel('Z [μm]')
+    ax3.set_title(f'Interferometric (iSCAT)\nφ_ref={np.degrees(reference_phase):.0f}°')
+    plt.colorbar(im3, ax=ax3, shrink=0.8, label='ΔI (bg subtracted)')
+    
+    ax4 = fig.add_subplot(2, 4, 4)
+    ax4.plot(x_coords, sim_interf._camera_image[N//2, :], 'b-', linewidth=2)
+    ax4.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    ax4.set_xlabel('Position [μm]')
+    ax4.set_ylabel('ΔIntensity [a.u.]')
+    ax4.set_title('Interferometry: Line Profile')
+    ax4.grid(True, alpha=0.3)
+    
+    # Row 2: Decomposition of interferometric signal
+    if sim_interf._interferometry_data is not None:
+        interf_data = sim_interf._interferometry_data
+        
+        ax5 = fig.add_subplot(2, 4, 5)
+        im5 = ax5.imshow(interf_data['I_scat'].T, origin='lower', extent=extent,
+                         cmap='hot', aspect='equal')
+        ax5.set_xlabel('X [μm]')
+        ax5.set_ylabel('Z [μm]')
+        ax5.set_title('|E_scat|² component\n(very weak, ∝ r⁶)')
+        plt.colorbar(im5, ax=ax5, shrink=0.8)
+        
+        ax6 = fig.add_subplot(2, 4, 6)
+        I_interf = interf_data['I_interference']
+        vmax_i = np.max(np.abs(I_interf))
+        im6 = ax6.imshow(I_interf.T, origin='lower', extent=extent,
+                         cmap='RdBu_r', aspect='equal', vmin=-vmax_i, vmax=vmax_i)
+        ax6.set_xlabel('X [μm]')
+        ax6.set_ylabel('Z [μm]')
+        ax6.set_title('2·Re(E_ref*·E_scat)\n(strong, ∝ r³)')
+        plt.colorbar(im6, ax=ax6, shrink=0.8)
+        
+        ax7 = fig.add_subplot(2, 4, 7)
+        I_ref = interf_data['I_ref']
+        im7 = ax7.imshow(I_ref.T, origin='lower', extent=extent,
+                         cmap='gray', aspect='equal')
+        ax7.set_xlabel('X [μm]')
+        ax7.set_ylabel('Z [μm]')
+        ax7.set_title('|E_ref|² (background)\n(uniform reference)')
+        plt.colorbar(im7, ax=ax7, shrink=0.8)
+    
+    # Summary panel
+    ax8 = fig.add_subplot(2, 4, 8)
+    ax8.axis('off')
+    
+    # Compute signal comparison
+    scat_max = np.max(sim_scattering._camera_image)
+    interf_max = np.max(np.abs(sim_interf._camera_image))
+    
+    if sim_interf._interferometry_data is not None:
+        I_scat_max = np.max(sim_interf._interferometry_data['I_scat'])
+        I_cross_max = np.max(np.abs(sim_interf._interferometry_data['I_interference']))
+        enhancement = I_cross_max / (I_scat_max + 1e-20)
+    else:
+        enhancement = 0
+    
+    summary_text = f"""
+INTERFEROMETRY ADVANTAGE
+{'='*45}
+
+Signal Scaling (Rayleigh regime):
+  • Scattering:      I ∝ |α|² ∝ r⁶
+  • Interferometry:  I ∝ Re(α) ∝ r³
+
+For this simulation (r = {radius_nm} nm):
+  • Scattering max:     {scat_max:.2e}
+  • |E_scat|² max:      {I_scat_max:.2e}
+  • Interference max:   {I_cross_max:.2e}
+  • Enhancement factor: {enhancement:.1f}x
+
+Physical Interpretation:
+  The interference term 2·Re(E_ref*·E_scat)
+  is LINEAR in E_scat, giving r³ scaling.
+  
+  This enables detection of particles
+  ~10-100x smaller than dark-field!
+
+Applications:
+  • iSCAT: Single protein detection
+  • COBRI: Label-free imaging
+  • Mass photometry: Molecular weighing
+"""
+    ax8.text(0.02, 0.98, summary_text, transform=ax8.transAxes,
+             fontfamily='monospace', fontsize=9,
+             verticalalignment='top')
+    
+    plt.suptitle(f'Scattering vs Interferometric Detection\n'
+                 f'Particle: R={radius_nm}nm, n=1.50, λ=488nm',
+                 fontsize=12, fontweight='bold')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"\nComparison figure saved to {save_path}")
+    
+    plt.show()
+    
+    return sim_scattering, sim_interf
+
+
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
@@ -1496,10 +2307,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="NTA FDTD Simulation for Nanoparticle Optical Imaging"
+        description="Interferometric FDTD Simulation for Nanoparticle Imaging (iSCAT-like)"
     )
-    parser.add_argument("--mode", choices=["single", "compare"], default="compare",
-                       help="Simulation mode: 'single' or 'compare'")
+    parser.add_argument("--mode", choices=["single", "compare", "interferometry", "spectral"], 
+                       default="interferometry",
+                       help="Simulation mode: 'single', 'compare' (smooth/rough), 'interferometry' (iSCAT vs scattering), or 'spectral' (FFT analysis)")
     parser.add_argument("--radius", type=float, default=80.0,
                        help="Particle radius in nm")
     parser.add_argument("--roughness", type=float, default=5.0,
@@ -1512,6 +2324,10 @@ if __name__ == "__main__":
                        help="Laser wavelength in nm")
     parser.add_argument("--na", type=float, default=0.3,
                        help="Objective numerical aperture")
+    parser.add_argument("--ref-amplitude", type=float, default=1.0,
+                       help="Reference beam amplitude for interferometry")
+    parser.add_argument("--ref-phase", type=float, default=0.0,
+                       help="Reference beam phase in degrees for interferometry")
     parser.add_argument("--no-save", action="store_true",
                        help="Don't save output figures")
     
@@ -1527,10 +2343,26 @@ if __name__ == "__main__":
             numerical_aperture=args.na,
             save_results=not args.no_save
         )
-    else:
+    elif args.mode == "compare":
         sim_smooth, sim_rough = compare_smooth_vs_rough(
             radius_nm=args.radius,
             roughness_nm=args.roughness,
             roughness_lmax=args.lmax,
             save_path="nta_comparison.png" if not args.no_save else None
+        )
+    elif args.mode == "spectral":
+        results = spectral_analysis_smooth_vs_rough(
+            radius_nm=args.radius,
+            roughness_nm=args.roughness,
+            roughness_lmax=args.lmax,
+            reference_amplitude=args.ref_amplitude,
+            save_path="spectral_analysis.png" if not args.no_save else None
+        )
+    else:  # interferometry mode
+        sim_scat, sim_interf = compare_interferometry_vs_scattering(
+            radius_nm=args.radius,
+            roughness_nm=args.roughness,
+            reference_amplitude=args.ref_amplitude,
+            reference_phase=np.radians(args.ref_phase),
+            save_path="interferometry_comparison.png" if not args.no_save else None
         )
