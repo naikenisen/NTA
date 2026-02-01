@@ -6,23 +6,22 @@ import mathutils
 # ============================================
 # SIMULATION NTA - Nanoparticle Tracking Analysis
 # Exosomes / Vésicules Extracellulaires
+# to train : blender --background --python main.py
+# to view ; blender NTA_exosome_simulation.blend
 # ============================================
 
 # --- Paramètres de simulation ---
 NUM_PARTICLES = 80          # Nombre de particules individuelles
-NUM_AGGREGATES = 8          # Nombre d'agrégats
-PARTICLES_PER_AGGREGATE = 5 # Particules par agrégat
 TOTAL_FRAMES = 500          # Durée de l'animation
 
-# Tailles des exosomes (en unités Blender, représentant ~30-150nm)
-MIN_EXOSOME_SIZE = 0.03     # ~30nm
-MAX_EXOSOME_SIZE = 0.15     # ~150nm
-AGGREGATE_SIZE_FACTOR = 2.5 # Les agrégats sont plus gros
+# Tailles des exosomes (en unités Blender, représentant ~100-200nm)
+MIN_EXOSOME_SIZE = 0.10     # ~100nm
+MAX_EXOSOME_SIZE = 0.20     # ~200nm
 
 # Zone de simulation (volume d'observation NTA)
-VOLUME_X = 4.0
-VOLUME_Y = 4.0
-VOLUME_Z = 2.0  # Profondeur de champ
+VOLUME_X = 8.0
+VOLUME_Y = 8.0
+VOLUME_Z = 10.0  # Profondeur de champ
 
 # Paramètres physiques
 TEMPERATURE = 298           # Kelvin (25°C)
@@ -108,7 +107,7 @@ def create_emission_material(name, radius, base_color=(0.4, 0.8, 1.0)):
     return mat
 
 
-def create_particle(name, radius, location, is_aggregate=False):
+def create_particle(name, radius, location):
     """
     Crée une particule (sphère) avec les propriétés appropriées
     """
@@ -121,11 +120,7 @@ def create_particle(name, radius, location, is_aggregate=False):
     obj = bpy.context.active_object
     obj.name = name
     
-    # Couleur différente pour les agrégats
-    if is_aggregate:
-        color = (1.0, 0.6, 0.2)  # Orange pour agrégats
-    else:
-        color = (0.3, 0.7, 1.0)  # Bleu pour exosomes individuels
+    color = (0.3, 0.7, 1.0)  # Bleu pour exosomes
     
     # Applique le matériau
     mat = create_emission_material(f"mat_{name}", radius, color)
@@ -276,45 +271,9 @@ for i in range(NUM_PARTICLES):
     
     obj = create_particle(f"exosome_{i:03d}", radius, (x, y, z))
     
-    # Calcul du coefficient de diffusion (inversement proportionnel à la taille)
-    radius_nm = radius * 1000  # Conversion en "nm" pour le calcul
-    diff_coeff = calculate_diffusion_coefficient(radius_nm)
-    
     particles.append({
         'object': obj,
-        'radius': radius,
-        'is_aggregate': False
-    })
-
-# --- Création des agrégats ---
-print(f"Création de {NUM_AGGREGATES} agrégats...")
-for i in range(NUM_AGGREGATES):
-    # Position centrale de l'agrégat
-    center_x = random.uniform(-VOLUME_X / 2, VOLUME_X / 2)
-    center_y = random.uniform(-VOLUME_Y / 2, VOLUME_Y / 2)
-    center_z = random.uniform(-VOLUME_Z / 2, VOLUME_Z / 2)
-    
-    # Taille de l'agrégat (plus gros que les exosomes individuels)
-    aggregate_radius = random.uniform(
-        MAX_EXOSOME_SIZE * 1.5,
-        MAX_EXOSOME_SIZE * AGGREGATE_SIZE_FACTOR
-    )
-    
-    obj = create_particle(
-        f"aggregate_{i:03d}",
-        aggregate_radius,
-        (center_x, center_y, center_z),
-        is_aggregate=True
-    )
-    
-    # Les agrégats diffusent plus lentement
-    radius_nm = aggregate_radius * 1000
-    diff_coeff = calculate_diffusion_coefficient(radius_nm) * 0.5
-    
-    particles.append({
-        'object': obj,
-        'radius': aggregate_radius,
-        'is_aggregate': True
+        'radius': radius
     })
 
 # --- Animation du mouvement brownien ---
