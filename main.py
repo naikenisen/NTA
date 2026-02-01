@@ -11,7 +11,8 @@ import mathutils
 # ============================================
 
 # --- Paramètres de simulation ---
-NUM_PARTICLES = 80          # Nombre de particules individuelles
+NUM_PARTICLES = 80          # Nombre de particules individuelles (exosomes)
+NUM_GRANULAR_PARTICLES = 20 # Nombre de particules granuleuses
 TOTAL_FRAMES = 500          # Durée de l'animation
 
 # Tailles des exosomes (en unités Blender, représentant ~100-200nm)
@@ -107,6 +108,54 @@ def create_emission_material(name, radius, base_color=(0.4, 0.8, 1.0)):
     return mat
 
 
+def create_granular_material(name, radius, base_color=(1.0, 0.6, 0.2)):
+    """
+    Crée un matériau émissif granuleux pour simuler des particules avec texture
+    Utilise un shader de bruit pour créer l'effet de granularité
+    """
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    
+    # Coordonnées de texture
+    tex_coord = nodes.new('ShaderNodeTexCoord')
+    tex_coord.location = (-600, 0)
+    
+    # Noeud de bruit pour la granularité
+    noise = nodes.new('ShaderNodeTexNoise')
+    noise.inputs['Scale'].default_value = random.uniform(15.0, 40.0)  # Granularité variable
+    noise.inputs['Detail'].default_value = random.uniform(8.0, 16.0)
+    noise.inputs['Roughness'].default_value = random.uniform(0.6, 0.9)
+    noise.location = (-400, 0)
+    
+    # Color Ramp pour contrôler le contraste de la granularité
+    color_ramp = nodes.new('ShaderNodeValToRGB')
+    color_ramp.color_ramp.elements[0].position = 0.3
+    color_ramp.color_ramp.elements[0].color = (*[c * 0.5 for c in base_color], 1.0)
+    color_ramp.color_ramp.elements[1].position = 0.7
+    color_ramp.color_ramp.elements[1].color = (*base_color, 1.0)
+    color_ramp.location = (-200, 0)
+    
+    # Noeud Emission
+    emission = nodes.new('ShaderNodeEmission')
+    emission.inputs['Strength'].default_value = calculate_rayleigh_intensity(radius) * 1.2
+    emission.location = (0, 0)
+    
+    # Noeud de sortie
+    output = nodes.new('ShaderNodeOutputMaterial')
+    output.location = (200, 0)
+    
+    # Connexions
+    links.new(tex_coord.outputs['Object'], noise.inputs['Vector'])
+    links.new(noise.outputs['Fac'], color_ramp.inputs['Fac'])
+    links.new(color_ramp.outputs['Color'], emission.inputs['Color'])
+    links.new(emission.outputs['Emission'], output.inputs['Surface'])
+    
+    return mat
+
+
 def create_particle(name, radius, location):
     """
     Crée une particule (sphère) avec les propriétés appropriées
@@ -124,6 +173,63 @@ def create_particle(name, radius, location):
     
     # Applique le matériau
     mat = create_emission_material(f"mat_{name}", radius, color)
+    obj.data.materials.append(mat)
+    
+    return obj
+
+
+def create_granular_particle(name, radius, location):
+    """
+    Crée une particule granuleuse avec une texture de surface variable
+    et un vrai relief 3D (displacement)
+    """
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        radius=radius,
+        segments=32,  # Plus de segments pour le displacement
+        ring_count=24,
+        location=location
+    )
+    obj = bpy.context.active_object
+    obj.name = name
+    
+    # --- Ajout du relief 3D avec displacement ---
+    # Subdiviser pour avoir plus de vertices à déplacer
+    subsurf = obj.modifiers.new(name="Subsurf", type='SUBSURF')
+    subsurf.levels = 2
+    subsurf.render_levels = 2
+    
+    # Créer une texture de bruit pour le displacement
+    displace = obj.modifiers.new(name="Displace", type='DISPLACE')
+    
+    # Créer une nouvelle texture
+    tex_name = f"tex_granular_{name}"
+    tex = bpy.data.textures.new(tex_name, type='CLOUDS')
+    tex.noise_scale = random.uniform(0.3, 0.8)
+    tex.noise_depth = random.randint(2, 6)
+    tex.noise_type = 'HARD_NOISE'
+    
+    displace.texture = tex
+    displace.texture_coords = 'LOCAL'
+    displace.strength = radius * random.uniform(0.15, 0.35)  # Force proportionnelle à la taille
+    displace.mid_level = 0.5
+    
+    # Appliquer les modificateurs pour figer la géométrie
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.modifier_apply(modifier="Subsurf")
+    bpy.ops.object.modifier_apply(modifier="Displace")
+    
+    # Lisser légèrement les normales
+    bpy.ops.object.shade_smooth()
+    
+    # Couleur orangée/dorée pour les particules granuleuses
+    color = (
+        random.uniform(0.8, 1.0),   # Rouge
+        random.uniform(0.4, 0.7),   # Vert
+        random.uniform(0.1, 0.3)    # Bleu
+    )
+    
+    # Applique le matériau granuleux
+    mat = create_granular_material(f"mat_granular_{name}", radius, color)
     obj.data.materials.append(mat)
     
     return obj
@@ -270,6 +376,28 @@ for i in range(NUM_PARTICLES):
     z = random.uniform(-VOLUME_Z / 2, VOLUME_Z / 2)
     
     obj = create_particle(f"exosome_{i:03d}", radius, (x, y, z))
+    
+    particles.append({
+        'object': obj,
+        'radius': radius
+    })
+
+# --- Création des particules granuleuses ---
+print(f"Création de {NUM_GRANULAR_PARTICLES} particules granuleuses...")
+for i in range(NUM_GRANULAR_PARTICLES):
+    # Taille légèrement plus grande pour les particules granuleuses
+    radius = random.lognormvariate(
+        math.log((MIN_EXOSOME_SIZE + MAX_EXOSOME_SIZE) / 2 * 1.3),
+        0.5
+    )
+    radius = max(MIN_EXOSOME_SIZE * 0.8, min(MAX_EXOSOME_SIZE * 1.5, radius))
+    
+    # Position initiale aléatoire dans le volume
+    x = random.uniform(-VOLUME_X / 2, VOLUME_X / 2)
+    y = random.uniform(-VOLUME_Y / 2, VOLUME_Y / 2)
+    z = random.uniform(-VOLUME_Z / 2, VOLUME_Z / 2)
+    
+    obj = create_granular_particle(f"granular_{i:03d}", radius, (x, y, z))
     
     particles.append({
         'object': obj,
